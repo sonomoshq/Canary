@@ -1,12 +1,12 @@
 {
   "name": "canary",
-  "description": "Sonomos Canary — persistent PII leak counter for Claude Code. Tracks every piece of sensitive data you expose to AI across sessions. Regex + Claude self-scan hybrid detection with a running counter and interactive dashboard.",
-  "version": "1.3.0",
+  "description": "Sonomos Canary — persistent PII leak counter for Claude Code. 36 checksum-validated regex detectors plus Claude self-scan catch sensitive data you expose to AI across sessions, with an interactive dashboard, a persistent HUD, and a plugin-security audit (/canary:audit) for your installed skills, agents, and MCP configs.",
+  "version": "1.4.0",
   "author": {
     "name": "Sonomos, Inc."
   },
   "homepage": "https://sonomos.ai",
-  "repository": "https://github.com/sonomos-ai/Canary-Plugin",
+  "repository": "https://github.com/sonomoshq/Canary",
   "license": "MIT",
   "keywords": ["privacy", "pii", "security", "sensitive-data", "leak-detection", "canary"],
   "category": "security",

@@ -2191,6 +2191,12 @@ def main():
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html_doc)
+    # The dashboard embeds redacted detection data — owner-only, like the
+    # rest of the data directory.
+    try:
+        os.chmod(out_path, 0o600)
+    except OSError:
+        pass
 
     should_open = (not args.no_open) and (not args.print_path_only) and _has_display()
     if should_open:

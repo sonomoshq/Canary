@@ -8,9 +8,21 @@ on:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # macOS runners occasionally omit jq; Linux runners always have it.
+      # This is also what makes the macOS leg meaningful: BSD grep (no -P)
+      # forces canary/scripts/detectors.sh and audit-plugins.sh through
+      # their Perl fallback path instead of the GNU grep -oP fast path.
+      - name: Ensure jq is available (macOS)
+        if: runner.os == 'macOS'
+        run: command -v jq || brew install jq
 
       - name: Validate JSON files
         run: |
@@ -33,12 +45,16 @@ jobs:
       - name: Check Python syntax
         run: python3 -c "import py_compile; py_compile.compile('canary/scripts/dashboard.py', doraise=True)"
 
+      # Docker container actions (this one included) only execute on Linux
+      # runners, so this step is Linux-only; static shell lint doesn't
+      # depend on OS anyway. severity:error is blocking (no
+      # continue-on-error) — a shellcheck error must fail the build.
       - name: Run shellcheck
+        if: runner.os == 'Linux'
         uses: ludeeus/action-shellcheck@master
         with:
           scandir: canary/scripts
-          severity: warning
-        continue-on-error: true
+          severity: error
 
       - name: Run detector tests
         run: bash tests/test-detectors.sh
@@ -51,3 +67,44 @@ jobs:
 
       - name: Run false positive tests
         run: bash tests/test-no-false-positives.sh
+
+      # Labeled benchmark corpus (tests/corpus.json) scored against
+      # tests/baseline.json: recall must not regress and no preserved
+      # (must-not-fire) type may newly fire. Improving recall on purpose
+      # requires bumping baseline.json's recall_min in the same PR — see
+      # CONTRIBUTING.md.
+      - name: Run corpus benchmark (recall / false-positive ratchet)
+        run: bash tests/test-corpus.sh
+
+      # Generates the dashboard in --demo mode (synthetic data only, never
+      # touches a real leaks.jsonl) and fails the build if the emitted HTML
+      # references any external resource — the product's core "zero
+      # network requests" claim, enforced mechanically instead of just
+      # documented. Plain <a href="https://..."> links (e.g. the sonomos.ai
+      # footer link) are intentionally NOT matched — only src=/@import/
+      # url(...) references, which is what an actual network fetch needs.
+      - name: Build demo dashboard and verify zero external references
+        run: |
+          DEMO_OUT="$(mktemp -d)/dashboard-demo.html"
+          python3 canary/scripts/dashboard.py --demo --no-open --out "$DEMO_OUT"
+          echo "Generated $DEMO_OUT ($(wc -c < "$DEMO_OUT") bytes)"
+          grep -E '(src=|@import|url\()["'"'"']?https?://' "$DEMO_OUT" && exit 1 || true
+          echo "OK: no external src=/@import/url() references found."
+
+      # Keeps the version badge in the README from silently drifting from
+      # the plugin manifest (which is what /plugin install actually reads).
+      - name: Verify README badge version matches plugin.json
+        run: |
+          PLUGIN_VERSION=$(python3 -c "import json; print(json.load(open('canary/.claude-plugin/plugin.json'))['version'])")
+          README_VERSION=$(grep -oE 'version-[0-9]+\.[0-9]+\.[0-9]+-blue' README.md | head -1 | sed -E 's/version-([0-9.]+)-blue/\1/')
+          echo "plugin.json version: $PLUGIN_VERSION"
+          echo "README badge version: $README_VERSION"
+          if [[ -z "$README_VERSION" ]]; then
+            echo "Could not find a version badge in README.md"
+            exit 1
+          fi
+          if [[ "$PLUGIN_VERSION" != "$README_VERSION" ]]; then
+            echo "MISMATCH: README badge ($README_VERSION) != plugin.json version ($PLUGIN_VERSION)"
+            exit 1
+          fi
+          echo "OK: versions match."

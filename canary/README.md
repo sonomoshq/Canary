@@ -6,75 +6,32 @@ Every time you interact with Claude, you may be sharing sensitive data — email
 
 The number only goes up.
 
+This is the plugin package itself (what `/plugin install` pulls down). For the full pitch, the detector list, the HUD reference, the plugin-audit docs, and the privacy/security model, see the **[root README](../README.md)**.
+
 ## Install
 
 ```bash
-/plugin marketplace add sonomos-ai/Canary-Plugin
+/plugin marketplace add sonomoshq/Canary
 /plugin install canary@sonomos
 ```
-
-## How It Works
-
-```
-You type a message → Claude processes it → Stop hook fires (async)
-                                               │
-                                     ┌─────────┴─────────┐
-                                Regex Detectors      LLM Self-Scan
-                              (16 patterns, checksums)  (70+ categories)
-                                     └─────────┬─────────┘
-                                               │
-                                    Append to ~/.sonomos/leaks.jsonl
-                                               │
-                           Next session start → counter displayed
-
-Deep scan:  /canary:scan  →  Claude scans full conversation history
-                              (automatic scan covers latest message only)
-```
-
-### Detection
-
-**Regex (automatic, every task, ~10ms):**
-16 detectors with checksum validation — Luhn (credit cards), MOD-97 (IBAN), ABA routing checksums, Base58Check (Bitcoin), EIP-55 (Ethereum), MOD-11 (VIN), SSA exclusion rules (SSN).
-
-**Claude Self-Scan (automatic, zero cost):**
-Claude scans each new user message for 70+ semantic categories — names, addresses, legal IDs, medical records, trade secrets, crypto seed phrases, organizational data, and more. Run `/canary:scan` for a deep scan of the full conversation history.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/canary:leaked` | Open interactive HTML dashboard |
-| `/canary:leaked stats` | Print text summary |
-| `/canary:scan` | Deep scan of full conversation history |
-| `/canary:leaked reset` | Clear all data (with confirmation) |
+| `/canary:leaked [stats\|reset\|demo]` | Dashboard (default) · text summary · reset (confirms first) · demo data |
+| `/canary:scan [full\|quick]` | Claude reads the transcript itself for 70+ semantic PII categories |
+| `/canary:audit [--record] [--strict]` | Scan installed skills/agents/plugins/MCP configs for leaked secrets and exfiltration patterns |
 
-## Persistent Counter
+CLI tools `canary-stats` and `canary-export` (see `canary/bin/`) are on `PATH` while the plugin is enabled.
 
-Add to `~/.claude/settings.json` to always see your PII count:
+## Detection, in brief
 
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "bash ~/.sonomos/statusline.sh"
-  }
-}
-```
+- **Regex (automatic, every Stop + every file write/edit):** 36 detector types, checksum-validated where the format supports it.
+- **Claude self-scan (automatic, zero cost):** semantic categories regex can't catch — names, addresses, legal IDs, medical records, trade secrets — on every Stop hook. Categories the regex layer already owns are excluded here to avoid double-counting.
+- **`/canary:audit` (on demand):** turns the same detector library on your *installed extensions* instead of your conversation.
 
-Color-coded: green (0), yellow (<10), red (≥10).
-
-## Data Storage
-
-All data is local at `~/.sonomos/`:
-
-| File | Purpose |
-|------|---------|
-| `leaks.jsonl` | Detected PII items (redacted values only) |
-| `dashboard.html` | Generated dashboard |
-| `statusline.sh` | Counter script (copied on first run) |
-| `.cursor_*` | Scan cursors per transcript |
-
-**Privacy:** Values are redacted at detection time using a "first 2 + last 2" rule — the middle characters are replaced with bullet points. For example, `4532015112830366` becomes `45••••••••••••66`. Values of 5 characters or fewer are fully masked as `••••`. Raw PII is never stored. All files are created with `0700`/`0600` permissions (owner-only access).
+Full architecture, the complete detector list, and the HUD/privacy docs live in the [root README](../README.md).
 
 ## Plugin Structure
 
@@ -83,16 +40,18 @@ canary/
 ├── .claude-plugin/plugin.json       # Plugin manifest
 ├── hooks/hooks.json                 # Stop, PostToolUse, SessionStart hooks
 ├── scripts/
-│   ├── detectors.sh                 # 16 regex detectors with checksum validation
-│   ├── scan.sh                      # Stop hook: regex scan on new messages
+│   ├── detectors.sh                 # 36 regex detectors with checksum validation
+│   ├── scan.sh                      # Stop hook: regex scan on new transcript messages
 │   ├── scan-file.sh                 # PostToolUse hook: scan written/edited files
-│   ├── session-start.sh             # SessionStart hook: welcome + summary
-│   ├── statusline.sh                # Rich HUD for status bar
-│   ├── record-llm-hit.sh           # Record LLM-detected hits safely (jq)
+│   ├── session-start.sh             # SessionStart hook: welcome + summary + streaks
+│   ├── statusline.sh                # Rich, cached HUD for the status bar
+│   ├── record-llm-hit.sh            # Record LLM-detected hits safely (jq + re-redaction)
+│   ├── audit-plugins.sh             # /canary:audit — scan installed extensions
 │   └── dashboard.py                 # Interactive HTML dashboard generator
 ├── skills/
-│   ├── leaked/SKILL.md              # /canary:leaked — dashboard, stats, reset
-│   └── scan/SKILL.md               # /canary:scan — deep conversation scan
+│   ├── leaked/SKILL.md              # /canary:leaked — dashboard, stats, reset, demo
+│   ├── scan/SKILL.md                # /canary:scan — deep conversation scan
+│   └── audit/SKILL.md               # /canary:audit — installed-extension audit
 ├── agents/
 │   └── pii-audit.md                 # Cross-session PII audit agent
 ├── bin/
