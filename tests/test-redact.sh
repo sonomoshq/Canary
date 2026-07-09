@@ -14,8 +14,11 @@ FAIL=0
 # redact() depends on the pre-built DOT_MASKS array (bug #10 fix — a
 # lookup table instead of spawning seq/printf per hit), so that
 # initialization block has to be sourced first too.
-source <(sed -n '/^DOT_MASKS=/,/^unset _dm _i/p' "$DETECTORS")
-source <(sed -n '/^redact()/,/^}/p' "$DETECTORS")
+# eval "$(...)" rather than source <(...): process substitution as a
+# source target is unreliable on macOS's bash 3.2 (function silently
+# never defined; sed dies of SIGPIPE) — caught by the macOS CI leg.
+eval "$(sed -n '/^DOT_MASKS=/,/^unset _dm _i/p' "$DETECTORS")"
+eval "$(sed -n '/^redact()/,/^}/p' "$DETECTORS")"
 
 assert_redact() {
   local label="$1"
