@@ -166,6 +166,29 @@ fi
 
 chmod 600 "$LEAKS_FILE" 2>/dev/null || true
 
+# ── Optional user-defined rules (rules.d/*.json) ──────────────────────
+# Runs only when python3 is present and the user has defined rules —
+# zero overhead and no errors otherwise. Same JSON hit shape as detectors.sh.
+if command -v python3 >/dev/null 2>&1 && ls "$SONOMOS_DIR"/rules.d/*.json >/dev/null 2>&1; then
+  CR_TMP=$(mktemp 2>/dev/null || true)
+  if [[ -n "$CR_TMP" ]]; then
+    printf '%s' "$FILE_TEXT" > "$CR_TMP" 2>/dev/null || true
+    CLAUDE_PLUGIN_DATA="$SONOMOS_DIR" python3 "$SCRIPT_DIR/custom_rules.py" "$CR_TMP" 2>/dev/null | \
+      while IFS= read -r hit; do
+        [[ -z "$hit" ]] && continue
+        HIT_CONF=$(printf '%s' "$hit" | jq -r '.confidence // "medium"' 2>/dev/null || echo "medium")
+        [[ "$CONFIDENCE_THRESHOLD" == "high" && "$HIT_CONF" != "high" ]] && continue
+        printf '%s' "$hit" | jq -c \
+          --arg ts "$TIMESTAMP" --arg sid "$SESSION_ID" \
+          --arg src "$SRC_TAG" --arg cwd "$HOOK_CWD" \
+          '. + {timestamp: $ts, session_id: $sid, source: $src}
+             + (if $cwd != "" then {cwd: $cwd} else {} end)' >> "$LEAKS_FILE" 2>/dev/null || true
+      done
+    rm -f "$CR_TMP" 2>/dev/null || true
+    chmod 600 "$LEAKS_FILE" 2>/dev/null || true
+  fi
+fi
+
 # ── Canary Tokens: certain literal match on the same file content ─────
 # Guarded so a missing/unreadable library or empty canaries.jsonl is a
 # zero-overhead, zero-error no-op — this hook must still exit 0.
