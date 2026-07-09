@@ -1,29 +1,50 @@
 #!/usr/bin/env bash
 # Copyright © 2026 Sonomos, Inc.
-# canary-export — Export PII detections to CSV or JSON.
-# Usage: canary-export [--csv|--json] [--output FILE] [--help]
+# canary-export — Export PII detections to CSV or JSON, or emit an
+# anonymized team digest.
+# Usage: canary-export [--csv|--json] [--team-digest] [--output FILE] [--help]
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SONOMOS_DIR="${CLAUDE_PLUGIN_DATA:-$HOME/.sonomos}"
 LEAKS_FILE="$SONOMOS_DIR/leaks.jsonl"
+TAXONOMY_FILE="$SCRIPT_DIR/../scripts/taxonomy.json"
 FORMAT="csv"
+MODE="export"
 OUTPUT=""
 
 usage() {
   cat <<'EOF'
-Usage: canary-export [--csv|--json] [--output FILE] [--help]
+Usage: canary-export [--csv|--json] [--team-digest] [--output FILE] [--help]
 
-Export PII detections to CSV or JSON format. Malformed lines in
-leaks.jsonl are skipped individually rather than aborting the export.
+Export PII detections to CSV or JSON format, or emit an anonymized team
+digest. Malformed lines in leaks.jsonl are skipped individually rather
+than aborting the export.
+
+Modes:
+  (default)      Export every detection record.
+  --team-digest  Emit a values-stripped, counts-only summary suitable
+                 for pasting into Slack. No redacted values, cwd paths,
+                 value_ids, or session_ids are included — only aggregate
+                 counts, so it is safe to share outside the machine it
+                 ran on. Canary itself never sends this anywhere; it
+                 only prints to stdout/--output. Zero network, always.
 
 Options:
-  --csv       Output as CSV (default). Columns: type,value,detector,
-              confidence,timestamp,session_id,source,value_id,cwd
-              (the last three are blank when the record doesn't have them)
-  --json      Output as a JSON array
+  --csv       Output as CSV (default for export mode). Columns: type,
+              value,detector,confidence,timestamp,session_id,source,
+              value_id,cwd,risk_weight,sensitivity_class (blank when the
+              record — or the taxonomy — doesn't have the field)
+  --json      Output as a JSON array (export mode) or a JSON object
+              (--team-digest mode)
   --output/-o Write to file instead of stdout
   --help      Show this help and exit
+
+risk_weight and sensitivity_class (export mode) and the weighted grade
+(--team-digest mode) are looked up from canary/scripts/taxonomy.json.
+If that file is missing or unparseable, those fields/lines are left
+blank/omitted rather than failing the export.
 EOF
 }
 
@@ -31,6 +52,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --csv)  FORMAT="csv"; shift ;;
     --json) FORMAT="json"; shift ;;
+    --team-digest) MODE="digest"; shift ;;
     --output|-o) OUTPUT="${2:-}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -48,24 +70,230 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 0
 fi
 
-# validated — read leaks.jsonl and emit only the lines that are valid,
-# compact JSON, one per line. A single malformed line (partial write,
-# disk-full truncation, etc.) is skipped rather than corrupting the
-# whole export.
+# Taxonomy is optional: risk_weight/sensitivity_class columns and the
+# team-digest weighted grade degrade gracefully (blank/omitted) when the
+# file is missing or fails to parse.
+HAVE_TAX=false
+TAX_JSON='{}'
+if [[ -f "$TAXONOMY_FILE" ]] && jq empty "$TAXONOMY_FILE" >/dev/null 2>&1; then
+  HAVE_TAX=true
+  TAX_JSON="$(cat "$TAXONOMY_FILE")"
+fi
+
+# Flatten taxonomy.json into a tiny TSV once, for the --team-digest awk
+# aggregator below. This jq call's cost is proportional to taxonomy.json
+# (a few KB, ~60 types) — NOT to leaks.jsonl — so it's negligible no
+# matter how large the leaks file grows.
+TAX_META=""
+if $HAVE_TAX; then
+  TAX_META=$(printf '%s' "$TAX_JSON" | jq -r '
+    (["DEFAULT", (.default.risk_weight // 3), (.default.sensitivity_class // "pii")] | @tsv),
+    (["FALLBACK", (.grade_fallback // "F")] | @tsv),
+    (.types // {} | to_entries[] | (["TYPE", .key, (.value.risk_weight // 3),
+      (.value.sensitivity_class // "pii")] | @tsv)),
+    (.confidence_multiplier // {} | to_entries[] | (["CMUL", .key, .value] | @tsv)),
+    (.grade_bands // [] | .[] | (["BAND", .grade, .max] | @tsv))
+  ')
+fi
+HAVE_TAX_AWK=0
+$HAVE_TAX && HAVE_TAX_AWK=1
+
+# validated — a single jq process that parses leaks.jsonl line-by-line
+# (`jq -cR 'fromjson? // empty'`, the same idiom statusline.sh uses) and
+# emits only the valid, compact JSON records, one per line. A malformed
+# line (partial write, disk-full truncation, ...) is silently skipped
+# instead of a) aborting the whole export or b) costing a subprocess of
+# its own — this replaces the old while-read loop that spawned a
+# `jq -c .` subprocess per line (killed at 5m+, ~10% done, on 1M lines).
 validated() {
-  local line
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" ]] && continue
-    printf '%s' "$line" | jq -c . 2>/dev/null || true
-  done < "$LEAKS_FILE"
+  jq -cR 'fromjson? // empty' "$LEAKS_FILE"
+}
+
+generate_export() {
+  if [[ "$FORMAT" == "json" ]]; then
+    validated | jq -s --argjson TAX "$TAX_JSON" '
+      ($TAX.types // {}) as $types
+      | ($TAX.default // null) as $def
+      | map(
+          . as $h
+          | ($types[$h.type] // $def) as $tt
+          | $h + {
+              risk_weight: ($tt.risk_weight // null),
+              sensitivity_class: ($tt.sensitivity_class // null)
+            }
+        )
+    '
+  else
+    echo "type,value,detector,confidence,timestamp,session_id,source,value_id,cwd,risk_weight,sensitivity_class"
+    validated | jq -r --argjson TAX "$TAX_JSON" '
+      ($TAX.types // {}) as $types
+      | ($TAX.default // null) as $def
+      | . as $h
+      | ($types[$h.type] // $def) as $tt
+      | [
+          .type, .value, .detector, .confidence, .timestamp, .session_id,
+          (.source // ""), (.value_id // ""), (.cwd // ""),
+          ($tt.risk_weight // null), ($tt.sensitivity_class // null)
+        ] | @csv
+    '
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# --team-digest: an anonymized, values-stripped, counts-only aggregate.
+# It NEVER includes a redacted value, a cwd path, a value_id, or a raw
+# session_id — only aggregate counts (including a *count* of distinct
+# sessions, which is not itself identifying) — so it's safe to paste
+# into a team Slack channel for opt-in gamification without breaking
+# Canary's zero-telemetry, zero-network guarantee (this only ever
+# writes to stdout or --output; nothing is sent anywhere).
+#
+# Like canary-stats, the aggregation itself is a single awk pass over
+# the validated stream (not a jq `reduce`): distinct-session counting
+# needs a map keyed by every session_id seen, and building that as a
+# jq object via repeated `.foo[key] = value` scales with distinct-key
+# count badly enough to turn a few-second job into a slow one at
+# realistic session cardinalities — awk's associative arrays don't have
+# that problem. jq is used only for the tiny, fixed-size taxonomy
+# flattening above and the small JSON assembly below.
+# ─────────────────────────────────────────────────────────────────────
+DIGEST_AWK='
+  function field(s, name,    key, i, r, j) {
+    key = "\"" name "\":\""
+    i = index(s, key)
+    if (i == 0) return ""
+    r = substr(s, i + length(key))
+    j = index(r, "\"")
+    if (j == 0) return ""
+    return substr(r, 1, j - 1)
+  }
+  BEGIN {
+    n = split(tax_meta, lines, "\n")
+    for (i = 1; i <= n; i++) {
+      if (lines[i] == "") continue
+      m = split(lines[i], f, "\t")
+      kind = f[1]
+      if (kind == "DEFAULT") { def_rw = f[2] + 0; def_cls = f[3] }
+      else if (kind == "FALLBACK") { fallback_grade = f[2] }
+      else if (kind == "TYPE") { rw[f[2]] = f[3] + 0; clsmap[f[2]] = f[4] }
+      else if (kind == "CMUL") { cmul[f[2]] = f[3] + 0 }
+      else if (kind == "BAND") { nbands++; band_grade[nbands] = f[2]; band_max[nbands] = f[3] + 0 }
+    }
+  }
+  {
+    total++
+    ty = field($0, "type"); if (ty == "") ty = "unknown"
+    conf = field($0, "confidence")
+    sid = field($0, "session_id")
+    ts = field($0, "timestamp")
+
+    if (sid != "" && !(sid in sess)) { sess[sid] = 1; n_sess++ }
+    types[ty]++
+
+    if (length(ts) >= 10) {
+      d = substr(ts, 1, 10)
+      if (min_date == "" || d < min_date) min_date = d
+      if (max_date == "" || d > max_date) max_date = d
+    }
+
+    if (have_tax) {
+      rwv  = (ty in rw)     ? rw[ty]     : def_rw
+      clsv = (ty in clsmap) ? clsmap[ty] : def_cls
+      m = (conf in cmul) ? cmul[conf] : 0.6
+      score += rwv * m
+      by_class[clsv]++
+    }
+  }
+  END {
+    grade = "NA"; score_out = "NA"
+    if (have_tax) {
+      score_r = int(score * 100 + 0.5) / 100
+      score_out = score_r
+      grade = ""
+      for (i = 1; i <= nbands; i++) {
+        if (band_max[i] >= score_r) { grade = band_grade[i]; break }
+      }
+      if (grade == "") grade = fallback_grade
+    }
+    printf "SCALARS\t%d\t%d\t%s\t%s\t%s\t%s\n", total, n_sess, min_date, max_date, score_out, grade
+    for (t in types) printf "TYPE\t%s\t%d\n", t, types[t]
+    if (have_tax) {
+      for (c in by_class) printf "CLASS\t%s\t%d\n", c, by_class[c]
+    }
+  }
+'
+
+digest_aggregate() {
+  validated | awk -v tax_meta="$TAX_META" -v have_tax="$HAVE_TAX_AWK" "$DIGEST_AWK"
+}
+
+generate_digest_json() {
+  local out
+  out=$(digest_aggregate) || out='SCALARS	0			NA	NA'
+  [[ -z "$out" ]] && out='SCALARS	0			NA	NA'
+  printf '%s\n' "$out" | jq -R -s --arg havetax "$HAVE_TAX" '
+    (split("\n") | map(select(length > 0) | split("\t"))) as $rows
+    | (($rows[] | select(.[0] == "SCALARS")) // ["SCALARS","0","","","NA","NA"]) as $sc
+    | {
+        total: ($sc[1] | tonumber),
+        distinct_sessions: ($sc[2] | tonumber),
+        period: {start: (if $sc[3] == "" then null else $sc[3] end),
+                 end: (if $sc[4] == "" then null else $sc[4] end)},
+        by_type: ([$rows[] | select(.[0] == "TYPE") | {(.[1]): (.[2] | tonumber)}] | add // {})
+      }
+      + (if $havetax == "true" then
+          {
+            weighted_score: ($sc[5] | tonumber),
+            grade: $sc[6],
+            by_class: ([$rows[] | select(.[0] == "CLASS") | {(.[1]): (.[2] | tonumber)}] | add // {})
+          }
+        else {} end)
+  '
+}
+
+generate_digest_text() {
+  local out
+  out=$(digest_aggregate) || out='SCALARS	0			NA	NA'
+  [[ -z "$out" ]] && out='SCALARS	0			NA	NA'
+  local scalars_line
+  scalars_line=$(printf '%s\n' "$out" | awk -F'\t' '$1 == "SCALARS" { print; exit }')
+  local total sessions start end score grade
+  IFS=$'\t' read -r _ total sessions start end score grade <<< "$scalars_line"
+  [[ -z "$start" ]] && start="?"
+  [[ -z "$end" ]] && end="?"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Canary Team Digest (anonymized, counts-only)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Period: $start → $end"
+  echo "  Total detections: $total"
+  echo "  Distinct sessions: $sessions"
+  if [[ "$score" != "NA" ]]; then
+    echo "  Weighted grade: $grade  (score $score)"
+  fi
+  echo ""
+  echo "  By type:"
+  printf '%s\n' "$out" | awk -F'\t' '$1 == "TYPE" { print $2 "\t" $3 }' \
+    | sort -t "$(printf '\t')" -k2,2nr -k1,1 \
+    | awk -F'\t' '{printf "    %-24s %d\n", $1, $2}'
+  if [[ "$score" != "NA" ]]; then
+    echo ""
+    echo "  By sensitivity class:"
+    printf '%s\n' "$out" | awk -F'\t' '$1 == "CLASS" { print $2 "\t" $3 }' \
+      | sort -t "$(printf '\t')" -k2,2nr -k1,1 \
+      | awk -F'\t' '{printf "    %-24s %d\n", $1, $2}'
+  fi
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 generate_output() {
-  if [[ "$FORMAT" == "json" ]]; then
-    validated | jq -s '.'
+  if [[ "$MODE" == "digest" ]]; then
+    if [[ "$FORMAT" == "json" ]]; then
+      generate_digest_json
+    else
+      generate_digest_text
+    fi
   else
-    echo "type,value,detector,confidence,timestamp,session_id,source,value_id,cwd"
-    validated | jq -r '[.type, .value, .detector, .confidence, .timestamp, .session_id, (.source // ""), (.value_id // ""), (.cwd // "")] | @csv'
+    generate_export
   fi
 }
 

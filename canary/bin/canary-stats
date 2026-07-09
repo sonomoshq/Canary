@@ -5,8 +5,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SONOMOS_DIR="${CLAUDE_PLUGIN_DATA:-$HOME/.sonomos}"
 LEAKS_FILE="$SONOMOS_DIR/leaks.jsonl"
+TAXONOMY_FILE="$SCRIPT_DIR/../scripts/taxonomy.json"
 
 usage() {
   cat <<'EOF'
@@ -17,6 +19,14 @@ Quick PII exposure stats from ~/.sonomos/leaks.jsonl.
 Options:
   --json   Output stats as a single JSON object
   --help   Show this help and exit
+
+When jq and canary/scripts/taxonomy.json are both available, the report
+also includes a weighted risk score + letter grade (A+..F) and a
+regulatory/sensitivity breakdown (PCI / PHI / Secrets / GDPR), computed
+by joining each hit's type against the shared taxonomy's risk weights,
+sensitivity classes, and regulatory tags. If the taxonomy is missing or
+unparseable, these extra lines (and JSON fields) are omitted — every
+other stat is unaffected.
 EOF
 }
 
@@ -44,61 +54,202 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 0
 fi
 
-# jq's default parser stops at the first malformed JSON value in a
-# stream — one corrupted line (partial write, disk full, ...) must not
-# take the whole stats command down. Validate line-by-line into a clean
-# temp copy first, and compute every stat from that.
-CLEAN_FILE=$(mktemp "${TMPDIR:-/tmp}/canary-stats.XXXXXX" 2>/dev/null || true)
-if [[ -z "$CLEAN_FILE" ]]; then
-  echo "canary: could not create a temp file" >&2
-  wc -l < "$LEAKS_FILE"
-  exit 0
+# Taxonomy is optional: weighted scoring degrades gracefully (all other
+# stats are unaffected) when the file is missing or fails to parse.
+HAVE_TAX=false
+TAX_JSON='{}'
+if [[ -f "$TAXONOMY_FILE" ]] && jq empty "$TAXONOMY_FILE" >/dev/null 2>&1; then
+  HAVE_TAX=true
+  TAX_JSON="$(cat "$TAXONOMY_FILE")"
 fi
-trap 'rm -f "$CLEAN_FILE"' EXIT
 
-: > "$CLEAN_FILE"
-while IFS= read -r line || [[ -n "$line" ]]; do
-  [[ -z "$line" ]] && continue
-  printf '%s' "$line" | jq -c . 2>/dev/null >> "$CLEAN_FILE" || true
-done < "$LEAKS_FILE"
-
-TOTAL=$(wc -l < "$CLEAN_FILE" | tr -d ' ')
-SESSIONS=$(jq -r '.session_id' "$CLEAN_FILE" 2>/dev/null | sort -u | wc -l | tr -d ' ')
-HIGH=$(jq -r 'select(.confidence=="high") | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
-REGEX_COUNT=$(jq -r 'select(.detector=="regex") | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
-LLM_COUNT=$(jq -r 'select(.detector=="llm") | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
-
-# Unique-value dedup stats (only meaningful once value_id starts showing
-# up in records — older records without it are simply excluded).
-WITH_VID=$(jq -r 'select(.value_id != null and .value_id != "") | .value_id' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
-UNIQUE_VID=0
-if [[ "$WITH_VID" -gt 0 ]]; then
-  UNIQUE_VID=$(jq -r 'select(.value_id != null and .value_id != "") | .value_id' "$CLEAN_FILE" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+# Flatten taxonomy.json into a tiny TSV once. This jq call's cost is
+# proportional to taxonomy.json (a few KB, ~60 types) — NOT to
+# leaks.jsonl — so it stays negligible no matter how large the leaks
+# file grows.
+TAX_META=""
+if $HAVE_TAX; then
+  TAX_META=$(printf '%s' "$TAX_JSON" | jq -r '
+    (["DEFAULT", (.default.risk_weight // 3), (.default.sensitivity_class // "pii"),
+      ((.default.regulatory_tags // []) | join(","))] | @tsv),
+    (["FALLBACK", (.grade_fallback // "F")] | @tsv),
+    (.types // {} | to_entries[] | (["TYPE", .key, (.value.risk_weight // 3),
+      (.value.sensitivity_class // "pii"), ((.value.regulatory_tags // []) | join(","))] | @tsv)),
+    (.confidence_multiplier // {} | to_entries[] | (["CMUL", .key, .value] | @tsv)),
+    (.grade_bands // [] | .[] | (["BAND", .grade, .max] | @tsv))
+  ')
 fi
-REPEAT_EXPOSURES=$((WITH_VID - UNIQUE_VID))
 
-# Per-source breakdown: file: (PostToolUse scans), audit: (extension
-# audit --record), everything else is a conversation transcript hit
-# (regex Stop hook or Claude self-scan — neither tags a source).
-SRC_FILE=$(jq -r 'select((.source? // "") | startswith("file:")) | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
-SRC_AUDIT=$(jq -r 'select((.source? // "") | startswith("audit:")) | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
-SRC_TRANSCRIPT=$((TOTAL - SRC_FILE - SRC_AUDIT))
+# ─────────────────────────────────────────────────────────────────────
+# Single pass over leaks.jsonl, two processes total, regardless of file
+# size:
+#
+#  1) `jq -cR 'fromjson? // empty'` — the same idiom statusline.sh uses:
+#     one jq process parses each line independently and silently drops
+#     anything that isn't valid JSON. This is what replaces the old
+#     while-read loop that spawned a `jq -c .` subprocess PER LINE
+#     (2m39s at 1M lines) — one process now, not one per line.
+#
+#  2) a single awk pass that aggregates everything (counts by type/
+#     detector/confidence/session, unique value_ids, per-source
+#     breakdown, and — when the taxonomy is available — the weighted
+#     risk score/grade/class/regulatory breakdown) using awk's native
+#     hash tables. This deliberately is NOT done as a jq `reduce`:
+#     building a large map via repeated `.foo[key] = value` inside a jq
+#     reduce measured 5-10x slower than awk at realistic value_id/
+#     session_id cardinality (jq's persistent-object update cost grows
+#     with distinct-key count; awk's associative arrays don't), so awk
+#     does the counting and jq is used only for the tiny, fixed-size
+#     taxonomy flattening above and the small JSON assembly below —
+#     neither of which scales with leaks.jsonl size.
+# ─────────────────────────────────────────────────────────────────────
+AGG_AWK='
+  function field(s, name,    key, i, r, j) {
+    key = "\"" name "\":\""
+    i = index(s, key)
+    if (i == 0) return ""
+    r = substr(s, i + length(key))
+    j = index(r, "\"")
+    if (j == 0) return ""
+    return substr(r, 1, j - 1)
+  }
+  BEGIN {
+    n = split(tax_meta, lines, "\n")
+    for (i = 1; i <= n; i++) {
+      if (lines[i] == "") continue
+      m = split(lines[i], f, "\t")
+      kind = f[1]
+      if (kind == "DEFAULT") { def_rw = f[2] + 0; def_cls = f[3]; def_tags = f[4] }
+      else if (kind == "FALLBACK") { fallback_grade = f[2] }
+      else if (kind == "TYPE") { rw[f[2]] = f[3] + 0; clsmap[f[2]] = f[4]; tagsmap[f[2]] = f[5] }
+      else if (kind == "CMUL") { cmul[f[2]] = f[3] + 0 }
+      else if (kind == "BAND") { nbands++; band_grade[nbands] = f[2]; band_max[nbands] = f[3] + 0 }
+    }
+  }
+  {
+    total++
+    ty = field($0, "type"); if (ty == "") ty = "unknown"
+    conf = field($0, "confidence")
+    det = field($0, "detector")
+    sid = field($0, "session_id")
+    vid = field($0, "value_id")
+    src = field($0, "source")
+
+    if (conf == "high") high++
+    if (det == "regex") regex_ct++
+    if (det == "llm") llm_ct++
+    if (sid != "" && !(sid in sess)) { sess[sid] = 1; n_sess++ }
+    if (vid != "") {
+      with_vid++
+      if (!(vid in vids)) { vids[vid] = 1; n_uniq_vid++ }
+    }
+    if (substr(src, 1, 5) == "file:") src_file++
+    if (substr(src, 1, 6) == "audit:") src_audit++
+
+    types[ty]++
+
+    if (have_tax) {
+      rwv  = (ty in rw)      ? rw[ty]      : def_rw
+      clsv = (ty in clsmap)  ? clsmap[ty]  : def_cls
+      tgv  = (ty in tagsmap) ? tagsmap[ty] : def_tags
+      m = (conf in cmul) ? cmul[conf] : 0.6
+      score += rwv * m
+      by_class[clsv]++
+      if (tgv != "") {
+        ntag = split(tgv, tagarr, ",")
+        for (k = 1; k <= ntag; k++) by_reg[tagarr[k]]++
+      }
+    }
+  }
+  END {
+    repeat = with_vid - n_uniq_vid
+    src_transcript = total - src_file - src_audit
+    grade = "NA"; score_out = "NA"
+    if (have_tax) {
+      score_r = int(score * 100 + 0.5) / 100
+      score_out = score_r
+      grade = ""
+      for (i = 1; i <= nbands; i++) {
+        if (band_max[i] >= score_r) { grade = band_grade[i]; break }
+      }
+      if (grade == "") grade = fallback_grade
+    }
+    printf "SCALARS\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", \
+      total, n_sess, high, regex_ct, llm_ct, with_vid, n_uniq_vid, repeat, \
+      src_transcript, src_file, src_audit, score_out, grade
+    for (t in types) printf "TYPE\t%s\t%d\n", t, types[t]
+    if (have_tax) {
+      for (c in by_class) printf "CLASS\t%s\t%d\n", c, by_class[c]
+      for (r in by_reg) printf "REG\t%s\t%d\n", r, by_reg[r]
+    }
+  }
+'
+
+HAVE_TAX_AWK=0
+$HAVE_TAX && HAVE_TAX_AWK=1
+
+AWK_OUT=$(jq -cR 'fromjson? // empty' "$LEAKS_FILE" \
+  | awk -v tax_meta="$TAX_META" -v have_tax="$HAVE_TAX_AWK" "$AGG_AWK") \
+  || AWK_OUT='SCALARS	0	0	0	0	0	0	0	0	0	0	0	NA	NA'
+[[ -z "$AWK_OUT" ]] && AWK_OUT='SCALARS	0	0	0	0	0	0	0	0	0	0	0	NA	NA'
 
 if $JSON_MODE; then
-  TYPES=$(jq -r '.type' "$CLEAN_FILE" 2>/dev/null | sort | uniq -c | sort -rn | awk '{printf "\"%s\":%d,", $2, $1}' | sed 's/,$//')
-  echo "{\"total\":$TOTAL,\"sessions\":$SESSIONS,\"high_confidence\":$HIGH,\"regex\":$REGEX_COUNT,\"llm\":$LLM_COUNT,\"unique_values\":$UNIQUE_VID,\"repeat_exposures\":$REPEAT_EXPOSURES,\"sources\":{\"transcript\":$SRC_TRANSCRIPT,\"file\":$SRC_FILE,\"audit\":$SRC_AUDIT},\"types\":{$TYPES}}"
-else
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  Canary: $TOTAL PII items exposed"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  Sessions: $SESSIONS | High confidence: $HIGH"
-  echo "  Regex: $REGEX_COUNT | Claude self-scan: $LLM_COUNT"
-  if [[ "$WITH_VID" -gt 0 ]]; then
-    echo "  unique values: $UNIQUE_VID ($REPEAT_EXPOSURES repeat exposures)"
-  fi
-  echo "  by source: transcript: $SRC_TRANSCRIPT | file: $SRC_FILE | audit: $SRC_AUDIT"
-  echo ""
-  echo "  By type:"
-  jq -r '.type' "$CLEAN_FILE" 2>/dev/null | sort | uniq -c | sort -rn | head -15 | awk '{printf "    %-24s %d\n", $2, $1}'
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  printf '%s\n' "$AWK_OUT" | jq -R -s --arg havetax "$HAVE_TAX" '
+    (split("\n") | map(select(length > 0) | split("\t"))) as $rows
+    | (($rows[] | select(.[0] == "SCALARS")) // ["SCALARS","0","0","0","0","0","0","0","0","0","0","0","NA","NA"]) as $sc
+    | {
+        total: ($sc[1] | tonumber),
+        sessions: ($sc[2] | tonumber),
+        high_confidence: ($sc[3] | tonumber),
+        regex: ($sc[4] | tonumber),
+        llm: ($sc[5] | tonumber),
+        unique_values: ($sc[7] | tonumber),
+        repeat_exposures: ($sc[8] | tonumber),
+        sources: {transcript: ($sc[9] | tonumber), file: ($sc[10] | tonumber), audit: ($sc[11] | tonumber)},
+        types: ([$rows[] | select(.[0] == "TYPE") | {(.[1]): (.[2] | tonumber)}] | add // {})
+      }
+      + (if $havetax == "true" then
+          {
+            weighted_score: ($sc[12] | tonumber),
+            grade: $sc[13],
+            by_class: ([$rows[] | select(.[0] == "CLASS") | {(.[1]): (.[2] | tonumber)}] | add // {}),
+            by_regulatory: ([$rows[] | select(.[0] == "REG") | {(.[1]): (.[2] | tonumber)}] | add // {})
+          }
+        else {} end)
+  '
+  exit 0
 fi
+
+# ── Text mode: pull the scalars + histograms out of the awk output ────
+SCALARS_LINE=$(printf '%s\n' "$AWK_OUT" | awk -F'\t' '$1 == "SCALARS" { print; exit }')
+IFS=$'\t' read -r _ TOTAL SESSIONS HIGH REGEX_COUNT LLM_COUNT WITH_VID UNIQUE_VID \
+  REPEAT_EXPOSURES SRC_TRANSCRIPT SRC_FILE SRC_AUDIT SCORE GRADE <<< "$SCALARS_LINE"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Canary: $TOTAL PII items exposed"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Sessions: $SESSIONS | High confidence: $HIGH"
+echo "  Regex: $REGEX_COUNT | Claude self-scan: $LLM_COUNT"
+if [[ "$WITH_VID" -gt 0 ]]; then
+  echo "  unique values: $UNIQUE_VID ($REPEAT_EXPOSURES repeat exposures)"
+fi
+echo "  by source: transcript: $SRC_TRANSCRIPT | file: $SRC_FILE | audit: $SRC_AUDIT"
+if [[ "$SCORE" != "NA" ]]; then
+  echo "  Weighted risk: $SCORE  →  Grade: $GRADE"
+  IFS=$'\t' read -r PCI_CT PHI_CT SEC_CT GDPR_CT <<< "$(
+    printf '%s\n' "$AWK_OUT" | awk -F'\t' '
+      $1 == "CLASS" && $2 == "pci"    { pci = $3 }
+      $1 == "CLASS" && $2 == "phi"    { phi = $3 }
+      $1 == "CLASS" && $2 == "secret" { sec = $3 }
+      $1 == "REG" && index($2, "GDPR") { gdpr += $3 }
+      END { printf "%d\t%d\t%d\t%d\n", pci + 0, phi + 0, sec + 0, gdpr + 0 }
+    '
+  )"
+  echo "  PCI: $PCI_CT · PHI: $PHI_CT · Secrets: $SEC_CT · GDPR: $GDPR_CT"
+fi
+echo ""
+echo "  By type:"
+printf '%s\n' "$AWK_OUT" | awk -F'\t' '$1 == "TYPE" { print $2 "\t" $3 }' \
+  | sort -t "$(printf '\t')" -k2,2nr -k1,1 | head -15 \
+  | awk -F'\t' '{printf "    %-24s %d\n", $1, $2}'
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
