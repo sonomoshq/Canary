@@ -1,39 +1,104 @@
 #!/usr/bin/env bash
 # Copyright © 2026 Sonomos, Inc.
 # canary-stats — Quick PII exposure stats from the command line.
-# Usage: canary-stats [--json]
+# Usage: canary-stats [--json] [--help]
 
 set -euo pipefail
 
 SONOMOS_DIR="${CLAUDE_PLUGIN_DATA:-$HOME/.sonomos}"
 LEAKS_FILE="$SONOMOS_DIR/leaks.jsonl"
 
+usage() {
+  cat <<'EOF'
+Usage: canary-stats [--json] [--help]
+
+Quick PII exposure stats from ~/.sonomos/leaks.jsonl.
+
+Options:
+  --json   Output stats as a single JSON object
+  --help   Show this help and exit
+EOF
+}
+
+JSON_MODE=false
+for arg in "$@"; do
+  case "$arg" in
+    --json) JSON_MODE=true ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "canary-stats: unknown option: $arg" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
 if [[ ! -f "$LEAKS_FILE" || ! -s "$LEAKS_FILE" ]]; then
-  if [[ "${1:-}" == "--json" ]]; then
-    echo '{"total":0,"sessions":0,"high_confidence":0,"types":{},"detectors":{}}'
+  if $JSON_MODE; then
+    echo '{"total":0,"sessions":0,"high_confidence":0,"unique_values":0,"repeat_exposures":0,"sources":{"transcript":0,"file":0,"audit":0},"types":{},"detectors":{}}'
   else
     echo "No PII detected yet."
   fi
   exit 0
 fi
 
-TOTAL=$(wc -l < "$LEAKS_FILE")
-SESSIONS=$(jq -r '.session_id' "$LEAKS_FILE" 2>/dev/null | sort -u | wc -l)
-HIGH=$(jq -r 'select(.confidence=="high") | .type' "$LEAKS_FILE" 2>/dev/null | wc -l)
-REGEX_COUNT=$(jq -r 'select(.detector=="regex") | .type' "$LEAKS_FILE" 2>/dev/null | wc -l)
-LLM_COUNT=$(jq -r 'select(.detector=="llm") | .type' "$LEAKS_FILE" 2>/dev/null | wc -l)
+if ! command -v jq >/dev/null 2>&1; then
+  echo "canary: jq required for full stats — install jq" >&2
+  wc -l < "$LEAKS_FILE"
+  exit 0
+fi
 
-if [[ "${1:-}" == "--json" ]]; then
-  TYPES=$(jq -r '.type' "$LEAKS_FILE" | sort | uniq -c | sort -rn | awk '{printf "\"%s\":%d,", $2, $1}' | sed 's/,$//')
-  echo "{\"total\":$TOTAL,\"sessions\":$SESSIONS,\"high_confidence\":$HIGH,\"regex\":$REGEX_COUNT,\"llm\":$LLM_COUNT,\"types\":{$TYPES}}"
+# jq's default parser stops at the first malformed JSON value in a
+# stream — one corrupted line (partial write, disk full, ...) must not
+# take the whole stats command down. Validate line-by-line into a clean
+# temp copy first, and compute every stat from that.
+CLEAN_FILE=$(mktemp "${TMPDIR:-/tmp}/canary-stats.XXXXXX" 2>/dev/null || true)
+if [[ -z "$CLEAN_FILE" ]]; then
+  echo "canary: could not create a temp file" >&2
+  wc -l < "$LEAKS_FILE"
+  exit 0
+fi
+trap 'rm -f "$CLEAN_FILE"' EXIT
+
+: > "$CLEAN_FILE"
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -z "$line" ]] && continue
+  printf '%s' "$line" | jq -c . 2>/dev/null >> "$CLEAN_FILE" || true
+done < "$LEAKS_FILE"
+
+TOTAL=$(wc -l < "$CLEAN_FILE" | tr -d ' ')
+SESSIONS=$(jq -r '.session_id' "$CLEAN_FILE" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+HIGH=$(jq -r 'select(.confidence=="high") | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
+REGEX_COUNT=$(jq -r 'select(.detector=="regex") | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
+LLM_COUNT=$(jq -r 'select(.detector=="llm") | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
+
+# Unique-value dedup stats (only meaningful once value_id starts showing
+# up in records — older records without it are simply excluded).
+WITH_VID=$(jq -r 'select(.value_id != null and .value_id != "") | .value_id' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
+UNIQUE_VID=0
+if [[ "$WITH_VID" -gt 0 ]]; then
+  UNIQUE_VID=$(jq -r 'select(.value_id != null and .value_id != "") | .value_id' "$CLEAN_FILE" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+fi
+REPEAT_EXPOSURES=$((WITH_VID - UNIQUE_VID))
+
+# Per-source breakdown: file: (PostToolUse scans), audit: (extension
+# audit --record), everything else is a conversation transcript hit
+# (regex Stop hook or Claude self-scan — neither tags a source).
+SRC_FILE=$(jq -r 'select((.source? // "") | startswith("file:")) | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
+SRC_AUDIT=$(jq -r 'select((.source? // "") | startswith("audit:")) | .type' "$CLEAN_FILE" 2>/dev/null | wc -l | tr -d ' ')
+SRC_TRANSCRIPT=$((TOTAL - SRC_FILE - SRC_AUDIT))
+
+if $JSON_MODE; then
+  TYPES=$(jq -r '.type' "$CLEAN_FILE" 2>/dev/null | sort | uniq -c | sort -rn | awk '{printf "\"%s\":%d,", $2, $1}' | sed 's/,$//')
+  echo "{\"total\":$TOTAL,\"sessions\":$SESSIONS,\"high_confidence\":$HIGH,\"regex\":$REGEX_COUNT,\"llm\":$LLM_COUNT,\"unique_values\":$UNIQUE_VID,\"repeat_exposures\":$REPEAT_EXPOSURES,\"sources\":{\"transcript\":$SRC_TRANSCRIPT,\"file\":$SRC_FILE,\"audit\":$SRC_AUDIT},\"types\":{$TYPES}}"
 else
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "  Canary: $TOTAL PII items exposed"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "  Sessions: $SESSIONS | High confidence: $HIGH"
   echo "  Regex: $REGEX_COUNT | Claude self-scan: $LLM_COUNT"
+  if [[ "$WITH_VID" -gt 0 ]]; then
+    echo "  unique values: $UNIQUE_VID ($REPEAT_EXPOSURES repeat exposures)"
+  fi
+  echo "  by source: transcript: $SRC_TRANSCRIPT | file: $SRC_FILE | audit: $SRC_AUDIT"
   echo ""
   echo "  By type:"
-  jq -r '.type' "$LEAKS_FILE" | sort | uniq -c | sort -rn | head -15 | awk '{printf "    %-24s %d\n", $2, $1}'
+  jq -r '.type' "$CLEAN_FILE" 2>/dev/null | sort | uniq -c | sort -rn | head -15 | awk '{printf "    %-24s %d\n", $2, $1}'
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 fi

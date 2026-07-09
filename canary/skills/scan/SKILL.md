@@ -1,10 +1,10 @@
 ---
 name: scan
-description: Deep-scan the full conversation history for PII. Automatic scanning covers only the most recent message — use this for thorough audits of the entire session. Detects names, addresses, legal IDs, medical records, trade secrets, crypto credentials, API tokens, and 70+ other semantic categories.
+description: Use when the user worries they pasted a secret, asks "did I leak anything?", or wants a full-history privacy audit — the automatic scan only covers the latest message.
 disable-model-invocation: false
 user-invocable: true
 argument-hint: "[full|quick]"
-allowed-tools: Bash(cat *) Bash(jq *) Bash(echo *) Bash(wc *) Bash(python3 *)
+allowed-tools: Bash(cat:*), Bash(jq:*), Bash(echo:*), Bash(wc:*), Bash(python3:*), Bash(ls:*)
 ---
 
 # Sonomos LLM PII Scan
@@ -13,30 +13,25 @@ Scan your own conversation history for sensitive data that regex pattern matchin
 
 ## Instructions
 
-1. Read the conversation transcript:
+1. Find the transcript. List recent transcripts and pick the most recently modified one:
 
 ```bash
-TRANSCRIPT="!`cat /dev/stdin <<< '{}' | jq -r '.transcript_path // empty' 2>/dev/null`"
+ls -t ~/.claude/projects/*/*.jsonl 2>/dev/null | head -5
 ```
 
-If transcript path is not available from hook context, find the most recent transcript:
+The first line is the most recently modified transcript — use that one (if it's empty or unreadable, fall back to the next one in the list). Its filename stem (the part before `.jsonl`) is the session UUID — remember it as SESSION_ID for step 4.
+
+2. Extract user message text from that transcript with this jq filter:
 
 ```bash
-LATEST=$(ls -t ~/.claude/projects/*/sessions/*.jsonl 2>/dev/null | head -1)
+jq -r 'select(.type == "user") | .message.content | if type=="string" then . elif type=="array" then ([.[] | select(.type=="text") | .text] | join("\n")) else empty end' "$LATEST" 2>/dev/null
 ```
 
-2. Extract the last 3000 characters of user messages from the transcript:
+Honor `$ARGUMENTS`:
+- `quick` (or no argument): only the last ~6000 characters of that output — pipe through `tail -c 6000`.
+- `full`: ALL of it, every user message in the transcript. This is you reading and reasoning over the text, not a script — if it's long, work through it in batches mentally rather than truncating.
 
-```bash
-jq -r 'select(.type == "human") | .message.content // empty' "$LATEST" 2>/dev/null | tail -c 3000
-```
-
-If that yields nothing, try alternate format:
-```bash
-jq -r 'select(.role == "user") | if (.content | type) == "string" then .content elif (.content | type) == "array" then [.content[] | select(.type == "text") | .text] | join("\n") else empty end' "$LATEST" 2>/dev/null | tail -c 3000
-```
-
-3. Now scan that text yourself. Look for ALL of the following categories. For each item found, output a JSON line to append to the leaks file.
+3. Scan that text yourself. Look for ALL of the following categories. For each item found, you'll record a hit (step 4).
 
 ### Identity
 name, entity_name, us_passport, date_of_birth, us_ein_fein, national_id, tin_non_us, nhs_number, sin_canadian, us_itin, passport_non_us, license_plate
@@ -71,18 +66,20 @@ street_address, zip_code
 4. For each PII item found, redact the value (keep first 2 and last 2 chars, replace middle with dots), then record the hit:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-llm-hit.sh" "<category>" "<redacted>" "high"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-llm-hit.sh" "<category>" "<redacted>" "<high|medium>" "<SESSION_ID>"
 ```
 
-5. After scanning, report a summary:
-   - How many new items were found
-   - Breakdown by category
-   - Current running total from the leaks file
+Pass SESSION_ID (from step 1) as the 4th argument whenever you have it. Omit the 4th argument only if you couldn't determine it.
 
-If NO PII is found, say so clearly. That's a good result.
+5. Report a summary: how many new items were found, a breakdown by category, and the current running total from the leaks file (`wc -l` on `${CLAUDE_PLUGIN_DATA:-$HOME/.sonomos}/leaks.jsonl`).
+
+6. End your reply with exactly one machine-parseable status line:
+   - `LEAK_SCAN: CLEAN` if nothing was found, or
+   - `LEAK_SCAN: FOUND <n> item(s) — <type list>` (e.g. `LEAK_SCAN: FOUND 3 item(s) — name, us_passport, trade_secret`)
 
 ## Important
 - NEVER output raw PII values. Always redact: `jo••••oe`, `12••••89`, etc.
 - Focus on real PII, not example data, code variable names, or documentation references.
 - Be conservative — medium/high confidence only. Don't flag generic words as names.
+- If NO PII is found, say so clearly — that's a good result, and still end with `LEAK_SCAN: CLEAN`.
 - Copyright © 2026 Sonomos Inc. All rights reserved.

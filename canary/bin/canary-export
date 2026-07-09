@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copyright © 2026 Sonomos, Inc.
 # canary-export — Export PII detections to CSV or JSON.
-# Usage: canary-export [--csv|--json] [--output FILE]
+# Usage: canary-export [--csv|--json] [--output FILE] [--help]
 
 set -euo pipefail
 
@@ -10,23 +10,30 @@ LEAKS_FILE="$SONOMOS_DIR/leaks.jsonl"
 FORMAT="csv"
 OUTPUT=""
 
+usage() {
+  cat <<'EOF'
+Usage: canary-export [--csv|--json] [--output FILE] [--help]
+
+Export PII detections to CSV or JSON format. Malformed lines in
+leaks.jsonl are skipped individually rather than aborting the export.
+
+Options:
+  --csv       Output as CSV (default). Columns: type,value,detector,
+              confidence,timestamp,session_id,source,value_id,cwd
+              (the last three are blank when the record doesn't have them)
+  --json      Output as a JSON array
+  --output/-o Write to file instead of stdout
+  --help      Show this help and exit
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --csv)  FORMAT="csv"; shift ;;
     --json) FORMAT="json"; shift ;;
-    --output|-o) OUTPUT="$2"; shift 2 ;;
-    --help|-h)
-      echo "Usage: canary-export [--csv|--json] [--output FILE]"
-      echo ""
-      echo "Export PII detections to CSV or JSON format."
-      echo ""
-      echo "Options:"
-      echo "  --csv       Output as CSV (default)"
-      echo "  --json      Output as JSON array"
-      echo "  --output/-o Write to file instead of stdout"
-      exit 0
-      ;;
-    *) echo "Unknown option: $1" >&2; exit 1 ;;
+    --output|-o) OUTPUT="${2:-}"; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
 
@@ -35,24 +42,30 @@ if [[ ! -f "$LEAKS_FILE" || ! -s "$LEAKS_FILE" ]]; then
   exit 0
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "canary: jq required for export — install jq" >&2
+  wc -l < "$LEAKS_FILE"
+  exit 0
+fi
+
+# validated — read leaks.jsonl and emit only the lines that are valid,
+# compact JSON, one per line. A single malformed line (partial write,
+# disk-full truncation, etc.) is skipped rather than corrupting the
+# whole export.
+validated() {
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    printf '%s' "$line" | jq -c . 2>/dev/null || true
+  done < "$LEAKS_FILE"
+}
+
 generate_output() {
   if [[ "$FORMAT" == "json" ]]; then
-    echo "["
-    local first=true
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      if [[ "$first" == true ]]; then
-        first=false
-      else
-        echo ","
-      fi
-      printf "  %s" "$line"
-    done < "$LEAKS_FILE"
-    echo ""
-    echo "]"
+    validated | jq -s '.'
   else
-    echo "type,value,detector,confidence,timestamp,session_id"
-    jq -r '[.type, .value, .detector, .confidence, .timestamp, .session_id] | @csv' "$LEAKS_FILE" 2>/dev/null
+    echo "type,value,detector,confidence,timestamp,session_id,source,value_id,cwd"
+    validated | jq -r '[.type, .value, .detector, .confidence, .timestamp, .session_id, (.source // ""), (.value_id // ""), (.cwd // "")] | @csv'
   fi
 }
 
