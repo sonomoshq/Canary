@@ -17,6 +17,10 @@ source <(sed -n '/^aba_valid()/,/^}/p' "$DETECTORS")
 source <(sed -n '/^base58check_valid()/,/^}/p' "$DETECTORS")
 source <(sed -n '/^eth_valid()/,/^}/p' "$DETECTORS")
 source <(sed -n '/^ssn_valid()/,/^}/p' "$DETECTORS")
+source <(sed -n '/^is_repeated_digit()/,/^}/p' "$DETECTORS")
+source <(sed -n '/^nhs_valid()/,/^}/p' "$DETECTORS")
+source <(sed -n '/^npi_valid()/,/^}/p' "$DETECTORS")
+source <(sed -n '/^dea_valid()/,/^}/p' "$DETECTORS")
 
 assert_valid() {
   local label="$1"
@@ -83,6 +87,43 @@ assert_invalid "Area 666" "ssn_valid" "666121234"
 assert_invalid "Area 900+" "ssn_valid" "900121234"
 assert_invalid "Group 00" "ssn_valid" "123001234"
 assert_invalid "Serial 0000" "ssn_valid" "123450000"
+
+echo ""
+echo "=== NHS Number MOD-11 ==="
+assert_valid "Valid NHS (943476591 -> check 9)" "nhs_valid" "9434765919"
+assert_valid "Valid NHS with separators" "nhs_valid" "943 476 5919"
+assert_invalid "Wrong check digit" "nhs_valid" "9434765910"
+assert_invalid "Check digit computes to 10 (invalid by definition)" "nhs_valid" "1234567890"
+assert_invalid "All-same-digit rejected even though mod-11 'passes'" "nhs_valid" "1111111111"
+assert_invalid "Wrong length" "nhs_valid" "943476591"
+
+echo ""
+echo "=== NPI Luhn (80840 prefix) ==="
+assert_valid "Valid NPI" "npi_valid" "1234567893"
+assert_valid "Valid NPI 2" "npi_valid" "2345678918"
+assert_invalid "Wrong check digit" "npi_valid" "1234567891"
+assert_invalid "Wrong length" "npi_valid" "123456789"
+
+echo ""
+echo "=== DEA Registrant Check Digit ==="
+assert_valid "Valid DEA" "dea_valid" "AB1234563"
+assert_valid "Valid DEA 2" "dea_valid" "FA9876547"
+assert_invalid "Wrong check digit" "dea_valid" "AB1234560"
+assert_invalid "Missing letter prefix" "dea_valid" "121234563"
+assert_invalid "Wrong length" "dea_valid" "AB123456"
+
+echo ""
+echo "=== Canadian SIN (reuses Luhn) ==="
+assert_valid "Valid SIN" "luhn_valid" "046454286"
+assert_valid "Valid SIN 2" "luhn_valid" "130692544"
+assert_invalid "Invalid SIN (bad check digit)" "luhn_valid" "046454287"
+
+echo ""
+echo "=== Repeated-digit helper ==="
+assert_valid "All zeros" "is_repeated_digit" "000000000"
+assert_valid "All ones" "is_repeated_digit" "1111111111111111"
+assert_invalid "Mixed digits" "is_repeated_digit" "123456789"
+assert_invalid "Not digits-only" "is_repeated_digit" "1111111a"
 
 echo ""
 echo "==============================="
