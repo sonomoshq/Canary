@@ -10,17 +10,20 @@ DETECTORS="$SCRIPT_DIR/canary/scripts/detectors.sh"
 PASS=0
 FAIL=0
 
-# Source the validation functions from detectors.sh
-source <(sed -n '/^luhn_valid()/,/^}/p' "$DETECTORS")
-source <(sed -n '/^mod97_valid()/,/^}/p' "$DETECTORS")
-source <(sed -n '/^aba_valid()/,/^}/p' "$DETECTORS")
-source <(sed -n '/^base58check_valid()/,/^}/p' "$DETECTORS")
-source <(sed -n '/^eth_valid()/,/^}/p' "$DETECTORS")
-source <(sed -n '/^ssn_valid()/,/^}/p' "$DETECTORS")
-source <(sed -n '/^is_repeated_digit()/,/^}/p' "$DETECTORS")
-source <(sed -n '/^nhs_valid()/,/^}/p' "$DETECTORS")
-source <(sed -n '/^npi_valid()/,/^}/p' "$DETECTORS")
-source <(sed -n '/^dea_valid()/,/^}/p' "$DETECTORS")
+# Source the validation functions from detectors.sh.
+# eval "$(...)" rather than source <(...): process substitution as a
+# source target is unreliable on macOS's bash 3.2 (functions silently
+# never defined) — caught by the macOS CI leg.
+eval "$(sed -n '/^luhn_valid()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^mod97_valid()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^aba_valid()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^base58check_valid()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^eth_valid()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^ssn_valid()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^is_repeated_digit()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^nhs_valid()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^npi_valid()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^dea_valid()/,/^}/p' "$DETECTORS")"
 
 assert_valid() {
   local label="$1"
