@@ -1,0 +1,573 @@
+#!/usr/bin/env bash
+# Copyright © 2026 Sonomos, Inc.
+# All rights reserved.
+#
+# canary-card — neofetch/onefetch-style branded ANSI summary card. The
+# "screenshot to Slack" artifact: a small ASCII canary logo next to your
+# exposure stats (total, taxonomy-weighted grade + persona, distinct
+# types, clean streak, top category, 14-day sparkline).
+#
+# Usage: canary-card [--no-color] [--help]
+#
+# Standalone (no shared lib — mirrors bin/canary-stats, bin/canary-export):
+# reads $SONOMOS_DIR/leaks.jsonl + taxonomy.json + .state directly. Every
+# external command is guarded so a missing/malformed file degrades the
+# card instead of failing it. jq is OPTIONAL: without it the card still
+# renders (total, distinct types, top category, a count-based grade
+# fallback, and a family persona when taxonomy.json's shape can be
+# scraped without a real JSON parser) — see the no-jq branch below for
+# the exact limitation.
+#
+# Weighted grade = taxonomy.json._scoring: S = sum(risk_weight *
+# confidence_multiplier) over every hit; grade = first grade_bands entry
+# (top to bottom) whose max >= S, except A+ requires S == 0 exactly, else
+# grade_fallback. Identical rule to dashboard.py/statusline.sh/canary-badge
+# so the grade never disagrees across tools. Persona = taxonomy.json's
+# personas table, walked top to bottom against context {total,
+# distinct_types, dominant_class, dominant_family, night, tripped}.
+
+set -euo pipefail
+umask 0077
+
+# Capture the caller's real locale before anything might override it (we
+# don't force LC_ALL=C globally here the way statusline.sh does, but the
+# UTF-8 probe should still look at what the terminal actually asked for).
+ORIG_LC_ALL="${LC_ALL:-}"
+ORIG_LC_CTYPE="${LC_CTYPE:-}"
+ORIG_LANG="${LANG:-}"
+
+SONOMOS_DIR="${CLAUDE_PLUGIN_DATA:-${HOME:-/tmp}/.sonomos}"
+LEAKS_FILE="$SONOMOS_DIR/leaks.jsonl"
+STATE_FILE="$SONOMOS_DIR/.state"
+
+# bin/ and scripts/ ship side by side in the plugin bundle — try the
+# sibling scripts/ dir first, then CLAUDE_PLUGIN_ROOT (set when invoked
+# through a skill), then SONOMOS_DIR, then degrade taxonomy-driven
+# segments off entirely.
+case "${BASH_SOURCE[0]:-}" in
+  */*) BIN_DIR="${BASH_SOURCE[0]%/*}" ;;
+  *)   BIN_DIR="." ;;
+esac
+TAXONOMY_FILE=""
+for CAND in "$BIN_DIR/../scripts/taxonomy.json" "${CLAUDE_PLUGIN_ROOT:-}/scripts/taxonomy.json" "$SONOMOS_DIR/taxonomy.json"; do
+  if [[ -n "$CAND" && -f "$CAND" && -r "$CAND" ]]; then
+    TAXONOMY_FILE="$CAND"
+    break
+  fi
+done
+
+NUM_RE='^[0-9]+$'
+
+usage() {
+  cat <<'EOF'
+Usage: canary-card [--no-color] [--help]
+
+Render a branded ANSI summary card of your Canary PII exposure: total
+exposures, taxonomy-weighted grade + persona, distinct types, clean
+streak, top category, and a 14-day sparkline.
+
+Options:
+  --no-color   Disable ANSI color (mono card)
+  --help       Show this help and exit
+EOF
+}
+
+FORCE_NO_COLOR=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-color) FORCE_NO_COLOR=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "canary-card: unknown option: $arg" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+HAS_JQ=0
+if command -v jq >/dev/null 2>&1; then
+  HAS_JQ=1
+fi
+
+# ── UTF-8 capability probe (logo/sparkline glyphs) ──────────────
+UTF8_OK=0
+case "${ORIG_LC_ALL}${ORIG_LC_CTYPE}${ORIG_LANG}" in
+  *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UTF8_OK=1 ;;
+esac
+
+# ── Truecolor capability probe (same rule as statusline.sh) ─────
+COLOR_TIER="16"
+if [[ "$FORCE_NO_COLOR" -eq 1 ]] || [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]]; then
+  COLOR_TIER="mono"
+else
+  case "${COLORTERM:-}" in
+    *[Tt][Rr][Uu][Ee][Cc][Oo][Ll][Oo][Rr]*|*24[Bb][Ii][Tt]*) COLOR_TIER="truecolor" ;;
+    *)
+      case "${TERM:-}" in
+        *256color*) COLOR_TIER="256" ;;
+      esac
+      ;;
+  esac
+fi
+
+DIM=""; RST=""; B=""; CYN=""; GRN=""; YLW=""; RED=""
+if [[ "$COLOR_TIER" != "mono" ]]; then
+  DIM=$'\033[2m'; RST=$'\033[0m'; B=$'\033[1m'
+  CYN=$'\033[36m'; GRN=$'\033[1;32m'
+  YLW=$'\033[1;33m'; RED=$'\033[1;31m'
+fi
+
+# Sets GRADE_COLOR for the given letter grade, honoring COLOR_TIER. Same
+# palette as statusline.sh so a grade always reads as the same color
+# across the HUD and this card.
+grade_color() {
+  local g="$1"
+  if [[ "$COLOR_TIER" == "mono" ]]; then GRADE_COLOR=""; return; fi
+  if [[ "$COLOR_TIER" == "truecolor" ]]; then
+    case "$g" in
+      "A+") GRADE_COLOR=$'\033[1;38;2;0;220;110m' ;;
+      "A")  GRADE_COLOR=$'\033[1;38;2;90;210;90m' ;;
+      "B")  GRADE_COLOR=$'\033[1;38;2;190;200;60m' ;;
+      "C")  GRADE_COLOR=$'\033[1;38;2;230;170;40m' ;;
+      "D")  GRADE_COLOR=$'\033[1;38;2;235;110;40m' ;;
+      *)    GRADE_COLOR=$'\033[1;38;2;235;60;60m' ;;
+    esac
+    return
+  fi
+  if [[ "$COLOR_TIER" == "256" ]]; then
+    case "$g" in
+      "A+") GRADE_COLOR=$'\033[1;38;5;48m' ;;
+      "A")  GRADE_COLOR=$'\033[1;38;5;76m' ;;
+      "B")  GRADE_COLOR=$'\033[1;38;5;148m' ;;
+      "C")  GRADE_COLOR=$'\033[1;38;5;214m' ;;
+      "D")  GRADE_COLOR=$'\033[1;38;5;202m' ;;
+      *)    GRADE_COLOR=$'\033[1;38;5;196m' ;;
+    esac
+    return
+  fi
+  case "$g" in
+    "A+"|"A") GRADE_COLOR=$'\033[1;32m' ;;
+    "B"|"C")  GRADE_COLOR=$'\033[1;33m' ;;
+    *)        GRADE_COLOR=$'\033[1;31m' ;;
+  esac
+}
+
+# ── Sparkline glyph lookup (case dispatch — see statusline.sh for why
+# this isn't substring slicing). Sets SPARK_GLYPH.
+spark_glyph() {
+  if [[ "$UTF8_OK" -eq 1 ]]; then
+    case "$1" in
+      0) SPARK_GLYPH="▁" ;; 1) SPARK_GLYPH="▂" ;; 2) SPARK_GLYPH="▃" ;;
+      3) SPARK_GLYPH="▄" ;; 4) SPARK_GLYPH="▅" ;; 5) SPARK_GLYPH="▆" ;;
+      6) SPARK_GLYPH="▇" ;; *) SPARK_GLYPH="█" ;;
+    esac
+  else
+    case "$1" in
+      0) SPARK_GLYPH="." ;; 1) SPARK_GLYPH=":" ;; 2) SPARK_GLYPH="=" ;;
+      3) SPARK_GLYPH="-" ;; 4) SPARK_GLYPH="+" ;; 5) SPARK_GLYPH="*" ;;
+      6) SPARK_GLYPH="#" ;; *) SPARK_GLYPH="%" ;;
+    esac
+  fi
+}
+
+# ── civil_from_days: pure-integer epoch-day → Y/M/D (Howard Hinnant's
+# algorithm — see statusline.sh). Sets CIVIL_Y / CIVIL_M / CIVIL_D.
+civil_from_days() {
+  local z=$1 era doe yoe y doy mp d m
+  z=$((z + 719468))
+  if [[ $z -ge 0 ]]; then era=$((z / 146097)); else era=$(( (z - 146096) / 146097 )); fi
+  doe=$((z - era * 146097))
+  yoe=$(( (doe - doe/1460 + doe/36524 - doe/146096) / 365 ))
+  y=$((yoe + era * 400))
+  doy=$(( doe - (365*yoe + yoe/4 - yoe/100) ))
+  mp=$(( (5*doy + 2) / 153 ))
+  d=$(( doy - (153*mp + 2)/5 + 1 ))
+  if [[ $mp -lt 10 ]]; then m=$((mp + 3)); else m=$((mp - 9)); fi
+  if [[ $m -le 2 ]]; then y=$((y + 1)); fi
+  CIVIL_Y=$y; CIVIL_M=$m; CIVIL_D=$d
+}
+
+# ── Day-histogram lookup: $DAYHIST is "YYYY-MM-DD=N;...". Sets
+# DC_RESULT (default 0). No bash arrays (portability with statusline.sh).
+day_count_lookup() {
+  DC_RESULT=0
+  case ";${DAYHIST};" in
+    *";$1="*)
+      local rest="${DAYHIST#*"$1="}"
+      local val="${rest%%;*}"
+      if [[ "$val" =~ $NUM_RE ]]; then DC_RESULT="$val"; fi
+      ;;
+  esac
+}
+
+# Builds SPARK (14-day sparkline string) from $DAYHIST ("NONE" or empty
+# omits the segment entirely — a CLI tool, so one `date`-independent
+# epoch read is fine here).
+SPARK=""
+build_sparkline() {
+  if [[ -z "${DAYHIST:-}" || "$DAYHIST" == "NONE" ]]; then return 0; fi
+  local now
+  now="${EPOCHSECONDS:-}"
+  if [[ ! "$now" =~ $NUM_RE ]]; then now=$(date +%s 2>/dev/null) || now=0; fi
+  if [[ ! "$now" =~ $NUM_RE || "$now" -le 0 ]]; then return 0; fi
+
+  local sp_i sp_ep sp_zday sp_daystr sp_counts="" sp_min="" sp_max=""
+  sp_i=13
+  while [[ $sp_i -ge 0 ]]; do
+    sp_ep=$((now - sp_i * 86400))
+    sp_zday=$((sp_ep / 86400))
+    civil_from_days "$sp_zday"
+    printf -v sp_daystr '%04d-%02d-%02d' "$CIVIL_Y" "$CIVIL_M" "$CIVIL_D"
+    day_count_lookup "$sp_daystr"
+    sp_counts="${sp_counts}${DC_RESULT} "
+    if [[ -z "$sp_min" ]] || [[ "$DC_RESULT" -lt "$sp_min" ]]; then sp_min="$DC_RESULT"; fi
+    if [[ -z "$sp_max" ]] || [[ "$DC_RESULT" -gt "$sp_max" ]]; then sp_max="$DC_RESULT"; fi
+    sp_i=$((sp_i - 1))
+  done
+
+  # shellcheck disable=SC2034 # read via ${!sp_var} indirection below
+  read -r SD0 SD1 SD2 SD3 SD4 SD5 SD6 SD7 SD8 SD9 SD10 SD11 SD12 SD13 <<< "$sp_counts" || true
+  local sp_range sp_j sp_var sp_val sp_lvl
+  sp_range=$((sp_max - sp_min))
+  for sp_j in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+    sp_var="SD$sp_j"
+    sp_val="${!sp_var:-0}"
+    if [[ ! "$sp_val" =~ $NUM_RE ]]; then sp_val=0; fi
+    if [[ "$sp_range" -le 0 ]]; then sp_lvl=0; else sp_lvl=$(( (sp_val - sp_min) * 7 / sp_range )); fi
+    spark_glyph "$sp_lvl"
+    SPARK="${SPARK}${SPARK_GLYPH}"
+  done
+}
+
+# ── Clean streak from .state (same bounded plain-bash scan as
+# statusline.sh — no fork). ───────────────────────────────────────
+CLEAN_STREAK=0
+if [[ -f "$STATE_FILE" && -r "$STATE_FILE" ]]; then
+  SL_N=0
+  while IFS= read -r SL_LINE || [[ -n "$SL_LINE" ]]; do
+    case "$SL_LINE" in
+      CLEAN_STREAK=*)
+        CS_VAL="${SL_LINE#CLEAN_STREAK=}"
+        CS_VAL=${CS_VAL//[^0-9]/}
+        if [[ "$CS_VAL" =~ $NUM_RE ]]; then CLEAN_STREAK="$CS_VAL"; fi
+        break
+        ;;
+    esac
+    SL_N=$((SL_N + 1))
+    if [[ "$SL_N" -ge 64 ]]; then break; fi
+  done 2>/dev/null < "$STATE_FILE" || true
+fi
+
+# ══════════════════════════════════════════════════════════════
+#  Stats: total, distinct_types, grade, persona, top_type, DAYHIST
+# ══════════════════════════════════════════════════════════════
+TOTAL=0
+DISTINCT_TYPES=0
+WGRADE="A+"
+WSCORE="0.00"
+TOP_TYPE="none"
+PERSONA_EMOJI="🕊"
+PERSONA_LABEL="The Untouchable"
+PERSONA_BLURB="Nothing leaked. The canary sings."
+DAYHIST="NONE"
+GRADE_IS_ESTIMATE=0
+
+if [[ -f "$LEAKS_FILE" && -s "$LEAKS_FILE" ]]; then
+  if [[ "$HAS_JQ" -eq 1 ]]; then
+    # Validate line-by-line into a clean temp copy first (same idiom as
+    # bin/canary-stats): one corrupted line must never take the whole
+    # card down.
+    CLEAN_FILE=$(mktemp "${TMPDIR:-/tmp}/canary-card.XXXXXX" 2>/dev/null) || CLEAN_FILE=""
+    if [[ -n "$CLEAN_FILE" ]]; then
+      # No bash arrays for the conditional --slurpfile arg (this file
+      # targets bash 3.2 + set -u, where "${arr[@]}" on an empty array
+      # throws): always pass a real file to --slurpfile tax, falling back
+      # to a throwaway "null" one when taxonomy.json isn't found. The jq
+      # program's own `($tax[0]|type)=="object"` guard then falls back to
+      # its embedded defaultTax for a null/missing taxonomy.
+      TAX_TEMP=""
+      TAX_SLURP="$TAXONOMY_FILE"
+      if [[ -z "$TAX_SLURP" ]]; then
+        TAX_TEMP=$(mktemp "${TMPDIR:-/tmp}/canary-card-tax.XXXXXX" 2>/dev/null) || TAX_TEMP=""
+        if [[ -n "$TAX_TEMP" ]]; then
+          printf 'null' > "$TAX_TEMP" 2>/dev/null || true
+          TAX_SLURP="$TAX_TEMP"
+        fi
+      fi
+      trap 'rm -f "$CLEAN_FILE" "$TAX_TEMP"' EXIT
+      : > "$CLEAN_FILE"
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        printf '%s' "$line" | jq -c . 2>/dev/null >> "$CLEAN_FILE" || true
+      done < "$LEAKS_FILE"
+
+      if [[ -s "$CLEAN_FILE" && -n "$TAX_SLURP" ]]; then
+        JQ_OUT=$(jq -n -r --slurpfile leaks "$CLEAN_FILE" --slurpfile tax "$TAX_SLURP" '
+          def defaultTax:
+            { confidence_multiplier: {high:1.0, medium:0.6, low:0.3, certain:1.0},
+              grade_bands: [{grade:"A+",max:0},{grade:"A",max:8},{grade:"B",max:25},
+                             {grade:"C",max:75},{grade:"D",max:250}],
+              grade_fallback: "F",
+              default: {family:"Other", sensitivity_class:"pii", risk_weight:3},
+              types: {},
+              personas: [
+                {cond:"clean",label:"The Untouchable",emoji:"🕊",blurb:"Nothing leaked. The canary sings."},
+                {cond:"tripped",label:"The Tripwire",emoji:"🎯",blurb:"You planted a trap and walked right into it."},
+                {cond:"default",label:"The Canary",emoji:"🐤",blurb:"Watching what you share, one message at a time."}
+              ] };
+
+          def weightedGrade($score; $bands; $fallback):
+            ($bands | reduce .[] as $b ({found:false, grade:$fallback};
+                if .found then .
+                elif $b.grade == "A+" then (if $score == 0 then {found:true, grade:"A+"} else . end)
+                elif $score <= $b.max then {found:true, grade:$b.grade}
+                else . end
+              )) | .grade;
+
+          # Display-only rounding for S=. Every per-hit contribution is
+          # risk_weight (integer) times confidence_multiplier (0.3/0.6/1.0),
+          # so any real sum is exact to one decimal place — rounding to the
+          # nearest tenth here just clears the repeated-addition float noise
+          # (e.g. 49.599999999999994) without changing the value. Matches
+          # dashboard.py fmt_score(): integer-looking scores print bare,
+          # otherwise one decimal place. The unrounded $score is still what
+          # feeds weightedGrade() above — this never touches the grading.
+          def fmt_score($s):
+            ($s * 10 | round) as $tenths
+            | ($tenths / 10) as $r
+            | (($r - ($r | floor)) as $frac
+               | if $frac < 0.000001 and $frac > -0.000001 then ($r | floor | tostring)
+                 else ($r | tostring)
+                 end);
+
+          def personaFor($ctx; $personas):
+            (reduce $personas[] as $p ({found:false, persona:null};
+                if .found then .
+                else
+                  ($p.cond) as $cond
+                  | (
+                      if $cond == "clean" then ($ctx.total == 0)
+                      elif $cond == "tripped" then $ctx.tripped
+                      elif ($cond | startswith("class:")) then ($ctx.dominant_class == ($cond | ltrimstr("class:")))
+                      elif $cond == "night" then $ctx.night
+                      elif $cond == "polyglot" then ($ctx.distinct_types >= 12)
+                      elif $cond == "oversharer" then ($ctx.total >= 100)
+                      elif ($cond | startswith("family:")) then ($ctx.dominant_family == ($cond | ltrimstr("family:")))
+                      elif $cond == "default" then true
+                      else false
+                      end
+                    ) as $match
+                  | if $match then {found:true, persona:$p} else . end
+                end
+              )) | .persona // {label:"The Canary", emoji:"🐤", blurb:"Watching what you share, one message at a time."};
+
+          (if ($tax | length) > 0 and ($tax[0] | type) == "object" then $tax[0] else defaultTax end) as $taxonomy
+          | ($taxonomy.types // {}) as $types
+          | ($taxonomy.default // {family:"Other", sensitivity_class:"pii", risk_weight:3}) as $deflt
+          | ($taxonomy.confidence_multiplier // {high:1.0, medium:0.6, low:0.3, certain:1.0}) as $mult
+          | ($taxonomy.grade_bands // defaultTax.grade_bands) as $bands
+          | ($taxonomy.grade_fallback // "F") as $fallback
+          | ($taxonomy.personas // defaultTax.personas) as $personas
+          | ($leaks) as $L
+          | ($L | length) as $total
+          | ($L | map(.type // "unknown") | unique) as $utypes
+          | ($utypes | length) as $distinct_types
+          | (reduce $L[] as $r (0; . + (($types[$r.type].risk_weight // $deflt.risk_weight // 3) * ($mult[$r.confidence] // 1.0)))) as $score
+          | (weightedGrade($score; $bands; $fallback)) as $grade
+          | ($L | group_by(.type // "unknown") | map({type:(.[0].type // "unknown"), n:length}) | sort_by(-.n) | (.[0].type // "none")) as $top_type
+          | ($L | map(($types[.type].sensitivity_class // $deflt.sensitivity_class // "pii"))
+                | group_by(.) | map({k:.[0], n:length}) | sort_by(-.n) | (.[0].k // "pii")) as $dom_class
+          | ($L | map(($types[.type].family // $deflt.family // "Other"))
+                | group_by(.) | map({k:.[0], n:length}) | sort_by(-.n) | (.[0].k // "Other")) as $dom_family
+          | ( [ $L[] | select(.timestamp != null and ((.timestamp|type) == "string")) | .timestamp
+                | try (fromdateiso8601 | localtime | .[3] | tonumber) catch null ]
+              | map(select(. != null)) ) as $validhrs
+          | ( if ($validhrs|length) > 0 then (($validhrs | map(select(. < 5)) | length) / ($validhrs|length)) >= 0.3 else false end ) as $night
+          | ( any($L[]; (.type // "") == "canary_tripped") ) as $tripped
+          | ( [ $L[] | select(.timestamp != null and ((.timestamp|type) == "string") and ((.timestamp|length) >= 10))
+                | .timestamp[0:10] ] | group_by(.) | map("\(.[0])=\(length)") | join(";") ) as $dhist
+          | {total:$total, distinct_types:$distinct_types, score:$score, grade:$grade,
+             top_type:$top_type, dominant_class:$dom_class, dominant_family:$dom_family,
+             night:$night, tripped:$tripped} as $ctx
+          | personaFor($ctx; $personas) as $persona
+          | [$total, $distinct_types, $grade, fmt_score($score), $top_type,
+             ($persona.emoji // "🐤"), ($persona.label // "The Canary"),
+             ($persona.blurb // ""), (if $dhist == "" then "NONE" else $dhist end)]
+          | join("")
+        ' 2>/dev/null) || JQ_OUT=""
+      fi
+    fi
+
+    if [[ -n "${JQ_OUT:-}" ]]; then
+      IFS=$'\037' read -r TOTAL DISTINCT_TYPES WGRADE WSCORE TOP_TYPE \
+        PERSONA_EMOJI PERSONA_LABEL PERSONA_BLURB DAYHIST <<< "$JQ_OUT" || true
+      [[ "$TOTAL" =~ $NUM_RE ]] || TOTAL=0
+      [[ "$DISTINCT_TYPES" =~ $NUM_RE ]] || DISTINCT_TYPES=0
+      [[ -n "$WGRADE" ]] || WGRADE="A+"
+      [[ -n "$WSCORE" ]] || WSCORE="0"
+      [[ -n "$TOP_TYPE" ]] || TOP_TYPE="none"
+      [[ -n "$DAYHIST" ]] || DAYHIST="NONE"
+    fi
+  fi
+
+  # ── LIMITATION (no-jq path): total/distinct-types/top-category come
+  # from a plain awk pass (same string-index technique used throughout
+  # this plugin). The weighted grade needs taxonomy.json's nested risk
+  # weights, which aren't safely parseable without a real JSON parser —
+  # so without jq the grade is the simpler total-count fallback banding
+  # (0/4/9/24/99, matching dashboard.py's non-taxonomy risk_grade()), and
+  # the persona is dominant-family-only (scraped from taxonomy.json's
+  # flat one-line-per-type layout when present, else the generic default).
+  if [[ "$HAS_JQ" -ne 1 || -z "${JQ_OUT:-}" ]]; then
+    GRADE_IS_ESTIMATE=1
+    AWK_OUT=$(awk '
+      {
+        total++
+        ti = index($0, "\"type\":\"")
+        if (ti > 0) {
+          rest = substr($0, ti + 8)
+          te = index(rest, "\"")
+          if (te > 0) types[substr(rest, 1, te - 1)]++
+        }
+        tsi = index($0, "\"timestamp\":\"")
+        if (tsi > 0) {
+          rest2 = substr($0, tsi + 13)
+          tse = index(rest2, "\"")
+          if (tse > 0) {
+            ts = substr(rest2, 1, tse - 1)
+            if (length(ts) >= 10) day[substr(ts, 1, 10)]++
+          }
+        }
+      }
+      END {
+        num_types = 0
+        for (t in types) num_types++
+        best = ""; best_ct = 0
+        for (t in types) { if (types[t] > best_ct) { best = t; best_ct = types[t] } }
+        dhist = ""
+        for (dsel = 1; dsel <= 21; dsel++) {
+          bd = ""
+          for (dk in day) { if (bd == "" || dk > bd) bd = dk }
+          if (bd == "") break
+          if (dhist != "") dhist = dhist ";"
+          dhist = dhist bd "=" day[bd]
+          delete day[bd]
+        }
+        printf "%d\037%d\037%s\037%s\n", total+0, num_types+0, \
+          (best != "" ? best : "none"), (dhist != "" ? dhist : "NONE")
+      }
+    ' "$LEAKS_FILE" 2>/dev/null) || AWK_OUT=""
+    IFS=$'\037' read -r TOTAL DISTINCT_TYPES TOP_TYPE DAYHIST <<< "$AWK_OUT" || true
+    [[ "$TOTAL" =~ $NUM_RE ]] || TOTAL=0
+    [[ "$DISTINCT_TYPES" =~ $NUM_RE ]] || DISTINCT_TYPES=0
+    [[ -n "$TOP_TYPE" ]] || TOP_TYPE="none"
+    [[ -n "$DAYHIST" ]] || DAYHIST="NONE"
+
+    if   [[ "$TOTAL" -le 0 ]];  then WGRADE="A+"
+    elif [[ "$TOTAL" -le 4 ]];  then WGRADE="A"
+    elif [[ "$TOTAL" -le 9 ]];  then WGRADE="B"
+    elif [[ "$TOTAL" -le 24 ]]; then WGRADE="C"
+    elif [[ "$TOTAL" -le 99 ]]; then WGRADE="D"
+    else                             WGRADE="F"
+    fi
+    WSCORE="$TOTAL"
+
+    # Dominant-family persona floor (per task: "if too heavy, at least
+    # dominant-family persona"). Text-scrapes taxonomy.json's flat
+    # one-line-per-type layout for "<type>": { "family": "<Family>" — a
+    # real JSON parse would be needed for full correctness, so this is a
+    # best-effort match only, degrading to "Other" on any mismatch.
+    DOM_FAMILY="Other"
+    if [[ "$TOTAL" -gt 0 && -n "$TAXONOMY_FILE" ]]; then
+      DOM_FAMILY=$(awk -v top="\"$TOP_TYPE\":" '
+        index($0, top) { m = index($0, "\"family\": \""); if (m) { r = substr($0, m + 11); e = index(r, "\""); if (e) { print substr(r, 1, e - 1); exit } } }
+      ' "$TAXONOMY_FILE" 2>/dev/null) || DOM_FAMILY=""
+      [[ -z "$DOM_FAMILY" ]] && DOM_FAMILY="Other"
+    fi
+    if [[ "$TOTAL" -eq 0 ]]; then
+      PERSONA_EMOJI="🕊"; PERSONA_LABEL="The Untouchable"; PERSONA_BLURB="Nothing leaked. The canary sings."
+    else
+      case "$DOM_FAMILY" in
+        Identity)   PERSONA_EMOJI="👋"; PERSONA_LABEL="The Introducer";      PERSONA_BLURB="Names, emails, and IDs are your specialty." ;;
+        Financial)  PERSONA_EMOJI="💸"; PERSONA_LABEL="The Big Spender";     PERSONA_BLURB="Follow the money — it's in your transcripts." ;;
+        Network)    PERSONA_EMOJI="📡"; PERSONA_LABEL="The Broadcaster";     PERSONA_BLURB="Addresses and endpoints, freely shared." ;;
+        Technical)  PERSONA_EMOJI="🔐"; PERSONA_LABEL="The Secret Sprinkler";PERSONA_BLURB="Keys, tokens, and credentials everywhere you go." ;;
+        Crypto)     PERSONA_EMOJI="🤠"; PERSONA_LABEL="The Crypto Cowboy";   PERSONA_BLURB="Wallets and chains, shared without a second thought." ;;
+        Medical)    PERSONA_EMOJI="🩺"; PERSONA_LABEL="The Chart Leaker";    PERSONA_BLURB="Protected health data, out in the open." ;;
+        *)          PERSONA_EMOJI="🐤"; PERSONA_LABEL="The Canary";         PERSONA_BLURB="Watching what you share, one message at a time." ;;
+      esac
+    fi
+  fi
+fi
+
+build_sparkline
+
+# ══════════════════════════════════════════════════════════════
+#  Render
+# ══════════════════════════════════════════════════════════════
+grade_color "$WGRADE"
+
+# Severity color for the raw total (same 0/1-9/10+ bucketing as the HUD).
+if   [[ "$TOTAL" -le 0 ]]; then TOTAL_COLOR="$GRN"
+elif [[ "$TOTAL" -lt 10 ]]; then TOTAL_COLOR="$YLW"
+else                             TOTAL_COLOR="$RED"
+fi
+
+STREAK_TXT="none yet"
+if [[ "$CLEAN_STREAK" -ge 2 ]]; then STREAK_TXT="${CLEAN_STREAK} sessions"; fi
+
+SCORE_DISP="$WSCORE"
+if [[ "$GRADE_IS_ESTIMATE" -eq 1 ]]; then SCORE_DISP="~ count-based (no jq)"; fi
+
+PERSONA_BLURB_SAFE=${PERSONA_BLURB//$'\033'/}
+PERSONA_BLURB_SAFE=${PERSONA_BLURB_SAFE//$'\r'/}
+
+# ── ASCII canary logo (plain text — no color codes, no multibyte glyphs
+# baked in, so ${#var} stays an honest column count for the zip padding
+# below even when LC_ALL isn't UTF-8-aware). ────────────────────────
+# shellcheck disable=SC2034 # LOGO1..LOGO7 read via ${!lvar} indirection in the render loop below
+{
+LOGO1=""
+LOGO2="    __"
+LOGO3="  <(o )___"
+LOGO4="   ( ._> /"
+LOGO5="    \`---'"
+LOGO6=""
+LOGO7=" CANARY"
+}
+LOGO_WIDTH=12
+
+# ── Right column: key/value stats ───────────────────────────────
+# shellcheck disable=SC2034 # STAT1..STAT9 read via ${!svar} indirection in the render loop below
+{
+STAT1="${B}Canary — PII Exposure Card${RST}"
+STAT2=""
+STAT3="${DIM}Total exposures ${RST} ${TOTAL_COLOR}${TOTAL}${RST}"
+STAT4="${DIM}Weighted grade  ${RST} ${GRADE_COLOR}${WGRADE}${RST} ${DIM}(S=${SCORE_DISP})${RST}"
+STAT5="${DIM}Persona         ${RST} ${PERSONA_EMOJI} ${B}${PERSONA_LABEL}${RST} ${DIM}— ${PERSONA_BLURB_SAFE}${RST}"
+STAT6="${DIM}Distinct types  ${RST} ${CYN}${DISTINCT_TYPES}${RST}"
+STAT7="${DIM}Clean streak    ${RST} ${STREAK_TXT}"
+STAT8="${DIM}Top category    ${RST} ${TOP_TYPE}"
+STAT9=""
+if [[ -n "$SPARK" ]]; then
+  STAT9="${DIM}14-day trend    ${RST} ${SPARK}"
+fi
+}
+printf '\n'
+for i in 1 2 3 4 5 6 7 8 9; do
+  lvar="LOGO$i"
+  svar="STAT$i"
+  logo_line="${!lvar:-}"
+  stat_line="${!svar:-}"
+  pad=$(( LOGO_WIDTH - ${#logo_line} ))
+  if [[ $pad -lt 1 ]]; then pad=1; fi
+  if [[ $i -le 7 ]]; then
+    printf '  %s%s%s%*s%s\n' "$GRADE_COLOR" "$logo_line" "$RST" "$pad" "" "$stat_line"
+  else
+    # No logo glyph on these rows (LOGO8/LOGO9 don't exist, so logo_line is
+    # always "" here and pad == LOGO_WIDTH) — a single LOGO_WIDTH-wide blank
+    # field lines the stat text up with the i<=7 rows above. (Previously
+    # this printed LOGO_WIDTH *and* pad, double-indenting STAT8/STAT9.)
+    printf '  %*s%s\n' "$LOGO_WIDTH" "" "$stat_line"
+  fi
+done
+printf '\n'
+printf '  %sinstall: /plugin marketplace add sonomoshq/Canary%s\n' "$DIM" "$RST"
+printf '\n'
