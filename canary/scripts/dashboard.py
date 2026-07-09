@@ -26,6 +26,7 @@ import html
 import json
 import os
 import random
+import re
 import sys
 import webbrowser
 from collections import Counter
@@ -37,8 +38,19 @@ from datetime import date, datetime, timedelta
 
 SONOMOS_DIR = os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.expanduser("~/.sonomos")
 LEAKS_FILE = os.path.join(SONOMOS_DIR, "leaks.jsonl")
+CANARIES_FILE = os.path.join(SONOMOS_DIR, "canaries.jsonl")
 CONFIG_FILE = os.path.join(SONOMOS_DIR, "config.json")
 DEFAULT_OUTPUT_FILE = os.path.join(SONOMOS_DIR, "dashboard.html")
+# --demo defaults to a *sibling* file so `dashboard.py --demo` can never
+# silently clobber a user's real dashboard.html. Explicit --out always wins
+# over both of these.
+DEFAULT_DEMO_OUTPUT_FILE = os.path.join(SONOMOS_DIR, "dashboard-demo.html")
+
+# taxonomy.json lives next to this script — the shared scoring/family/persona
+# data model consumed by dashboard.py, wrapped.py, canary-stats, canary-card
+# and canary-badge. Loaded defensively below; every consumer here degrades
+# to a built-in equivalent if it's missing, unreadable, or malformed.
+TAXONOMY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "taxonomy.json")
 
 # ═════════════════════════════════════════════════════════════════════════
 # Constants
@@ -49,13 +61,47 @@ MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 WEEKDAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 VALID_DETECTORS = ("regex", "llm", "audit")
-VALID_CONFIDENCE = ("high", "medium")
+# record-llm-hit.sh emits "low" alongside "high"/"medium"; taxonomy.json's
+# confidence_multiplier additionally defines "certain" for forward
+# compatibility. Anything else normalizes to "unknown" (multiplier 0.6).
+VALID_CONFIDENCE = ("high", "medium", "low", "certain")
 
 # Family display order (fixed — never reordered, it's the categorical key).
+# "Tripwire" covers the canary_tripped type from taxonomy.json. Any family
+# name taxonomy.json introduces that isn't listed here still renders — see
+# _ordered_families() — just appended alphabetically after this fixed set.
 FAMILY_ORDER = [
     "Identity", "Financial", "Crypto", "Legal", "Medical",
-    "Technical", "Network", "Organizational", "Other",
+    "Technical", "Network", "Organizational", "Tripwire", "Other",
 ]
+
+# Short chip labels for taxonomy.json sensitivity classes (regulatory
+# exposure row). Falls back to a title-cased class key for anything new.
+CLASS_SHORT_LABEL = {
+    "pci": "PCI", "phi": "PHI", "pii": "PII", "secret": "Secrets",
+    "financial": "Financial", "network": "Network", "crypto": "Crypto",
+    "organizational": "Org", "public": "Public",
+}
+
+# ── Lighthouse-style per-family sub-score ──────────────────────────────
+# family_sub = round(100 * clamp(1 - family_weighted_S / K, 0, 1))
+#
+# K = 75 is a single shared "this family alone would be a C-grade problem"
+# threshold, taken directly from taxonomy.json's C-grade band ceiling: a
+# family whose weighted contribution *alone* would be enough to drag the
+# *whole* dashboard's score to C grade or worse is treated as maximally
+# unclean (score 0) for that family specifically. Using one shared K
+# (rather than a per-family constant) is deliberate: it lets naturally
+# higher-severity families (Technical/secrets, Crypto — risk_weight often
+# 6-10 per hit) bottom out after just a handful of hits, while naturally
+# lower-severity families (Network — risk_weight often 2-3 per hit) stay
+# green for longer. That matches real risk, not just hit count.
+FAMILY_SUBSCORE_K = 75.0
+
+# Lighthouse itself buckets 0-49 red / 50-89 orange / 90-100 green; reuse
+# that convention here so the sub-score meters read the same way.
+_LIGHTHOUSE_GOOD_MIN = 90
+_LIGHTHOUSE_MID_MIN = 50
 
 # categorize_type mapping — existing product mapping, extended per spec:
 #   sendgrid_api_key: Financial -> Technical
@@ -154,11 +200,39 @@ def categorize_type(t):
     return _TYPE_TO_FAMILY.get(t, "Other")
 
 
+def _fam_slug(fam):
+    """CSS-safe slug for a family name. Handles arbitrary taxonomy.json
+    family strings defensively (not just the fixed FAMILY_ORDER set)."""
+    s = re.sub(r"[^a-z0-9]+", "-", str(fam or "").lower()).strip("-")
+    return s or "other"
+
+
+def _ordered_families(family_totals):
+    """FAMILY_ORDER first (fixed categorical order), then any family
+    taxonomy.json introduces that isn't in that list, alphabetically. Only
+    families that actually have hits are included."""
+    present = [f for f in FAMILY_ORDER if family_totals.get(f, 0) > 0]
+    extra = sorted(f for f in family_totals if f not in FAMILY_ORDER and family_totals.get(f, 0) > 0)
+    return present + extra
+
+
 def fmt_int(n):
     try:
         return f"{int(n):,}"
     except (TypeError, ValueError):
         return "0"
+
+
+def fmt_score(s):
+    """Weighted risk score S — integer-looking scores print without a
+    decimal, otherwise one decimal place."""
+    try:
+        s = float(s)
+    except (TypeError, ValueError):
+        return "0"
+    if abs(s - round(s)) < 1e-9:
+        return fmt_int(round(s))
+    return f"{s:,.1f}"
 
 
 def fmt_date_short(d):
@@ -178,18 +252,11 @@ def sev_key(n):
     return "bad"
 
 
-def risk_grade(total):
-    if total <= 0:
-        return ("A+", "good")
-    if total <= 4:
-        return ("A", "good")
-    if total <= 9:
-        return ("B", "mid")
-    if total <= 24:
-        return ("C", "mid")
-    if total <= 99:
-        return ("D", "bad")
-    return ("F", "bad")
+_GRADE_SEV = {"A+": "good", "A": "good", "B": "mid", "C": "mid", "D": "bad", "F": "bad"}
+
+
+def grade_severity(letter):
+    return _GRADE_SEV.get(letter, "bad")
 
 
 _GRADE_VERDICT = {
@@ -325,6 +392,287 @@ def normalize_record(raw):
 
 def load_leaks():
     return [r for r in (normalize_record(x) for x in load_leaks_raw(LEAKS_FILE)) if r]
+
+
+_VALID_CANARY_STATUS = ("armed", "tripped")
+
+
+def normalize_canary(raw):
+    """Turn one arbitrary canaries.jsonl row into a safe, fully-defaulted
+    record. Never raises. The live decoy `value` field is intentionally
+    NEVER read here — it must never reach the HTML."""
+    if not isinstance(raw, dict):
+        return None
+
+    ctype = _safe_str(raw.get("type")).strip() or "unknown"
+    label = _safe_str(raw.get("label")).strip() or human_type_label(ctype)
+    planted_path = _safe_str(raw.get("planted_path")).strip()
+
+    created_raw = raw.get("created_at")
+    created_dt = _parse_timestamp(created_raw) if isinstance(created_raw, str) else None
+
+    tripped_raw = raw.get("tripped_at")
+    tripped_dt = _parse_timestamp(tripped_raw) if isinstance(tripped_raw, str) else None
+    tripped_source = _safe_str(raw.get("tripped_source")).strip()
+    tripped_session_id = _safe_str(raw.get("tripped_session_id")).strip()
+
+    status = _safe_str(raw.get("status")).strip().lower()
+    if status not in _VALID_CANARY_STATUS:
+        # Legacy/incomplete rows: infer from whether it has actually tripped.
+        status = "tripped" if tripped_dt is not None else "armed"
+
+    return {
+        "type": ctype,
+        "type_label": human_type_label(ctype),
+        "label": label,
+        "planted_path": planted_path,
+        "status": status,
+        "created_dt": created_dt,
+        "tripped_dt": tripped_dt,
+        "tripped_source": tripped_source,
+        "tripped_session_id": tripped_session_id,
+    }
+
+
+def load_canaries_raw(path):
+    """Read canaries.jsonl, tolerating blank lines and broken JSON — a
+    malformed line is skipped, never fatal."""
+    if not path or not os.path.exists(path):
+        return []
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except OSError:
+        return []
+    return out
+
+
+def load_canaries():
+    return [r for r in (normalize_canary(x) for x in load_canaries_raw(CANARIES_FILE)) if r]
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Taxonomy — shared scoring/family/persona data model (taxonomy.json)
+# ═════════════════════════════════════════════════════════════════════════
+
+
+def _default_taxonomy():
+    """Built-in mirror of taxonomy.json's structural defaults, used whenever
+    the file is missing or unreadable so the dashboard still renders with
+    sane, documented scoring instead of crashing or going silent. `types`
+    is intentionally empty here — with no file to consult, every type falls
+    through to `default` (family Other, weight 3), exactly as specified."""
+    return {
+        "confidence_multiplier": {"high": 1.0, "medium": 0.6, "low": 0.3, "certain": 1.0},
+        "grade_bands": [
+            {"grade": "A+", "max": 0},
+            {"grade": "A", "max": 8},
+            {"grade": "B", "max": 25},
+            {"grade": "C", "max": 75},
+            {"grade": "D", "max": 250},
+        ],
+        "grade_fallback": "F",
+        "personas": [
+            {"cond": "clean", "label": "The Untouchable", "emoji": "\U0001F54A️", "blurb": "Nothing leaked. The canary sings."},
+            {"cond": "tripped", "label": "The Tripwire", "emoji": "\U0001F3AF", "blurb": "You planted a trap and walked right into it."},
+            {"cond": "class:secret", "label": "The Secret Sprinkler", "emoji": "\U0001F510", "blurb": "Keys, tokens, and credentials everywhere you go."},
+            {"cond": "class:pci", "label": "The Cardholder", "emoji": "\U0001F4B3", "blurb": "Card numbers keep finding their way into the chat."},
+            {"cond": "class:phi", "label": "The Chart Leaker", "emoji": "\U0001FA7A", "blurb": "Protected health data, out in the open."},
+            {"cond": "class:crypto", "label": "The Crypto Cowboy", "emoji": "\U0001F920", "blurb": "Wallets and chains, shared without a second thought."},
+            {"cond": "night", "label": "The Night Owl", "emoji": "\U0001F989", "blurb": "Your worst leaks happen after midnight."},
+            {"cond": "polyglot", "label": "The Polyglot Leaker", "emoji": "\U0001F310", "blurb": "A little bit of every kind of sensitive data."},
+            {"cond": "oversharer", "label": "The Oversharer", "emoji": "\U0001F4E2", "blurb": "The number just keeps going up."},
+            {"cond": "family:Identity", "label": "The Introducer", "emoji": "\U0001F44B", "blurb": "Names, emails, and IDs are your specialty."},
+            {"cond": "family:Financial", "label": "The Big Spender", "emoji": "\U0001F4B8", "blurb": "Follow the money — it's in your transcripts."},
+            {"cond": "family:Network", "label": "The Broadcaster", "emoji": "\U0001F4E1", "blurb": "Addresses and endpoints, freely shared."},
+            {"cond": "family:Technical", "label": "The Secret Sprinkler", "emoji": "\U0001F510", "blurb": "Keys, tokens, and credentials everywhere you go."},
+            {"cond": "default", "label": "The Canary", "emoji": "\U0001F424", "blurb": "Watching what you share, one message at a time."},
+        ],
+        "classes": {
+            "pci": "Payment card data (PCI-DSS)",
+            "phi": "Protected health information (HIPAA)",
+            "pii": "Personally identifiable information",
+            "secret": "Credentials / API keys / keys",
+            "financial": "Financial account identifiers",
+            "network": "Network / device identifiers",
+            "crypto": "Blockchain addresses (pseudonymous)",
+            "organizational": "Business-confidential information",
+            "public": "Public-directory or low-sensitivity data",
+        },
+        "default": {"family": "Other", "sensitivity_class": "pii", "regulatory_tags": [], "risk_weight": 3},
+        "types": {},
+    }
+
+
+def load_taxonomy():
+    """Load taxonomy.json next to this script. Degrades key-by-key: any
+    top-level key that's missing or the wrong type falls back to the
+    built-in default for *that key only*, so a partially-corrupt file still
+    yields a fully-usable taxonomy instead of an all-or-nothing failure."""
+    fallback = _default_taxonomy()
+    obj = None
+    if TAXONOMY_FILE and os.path.exists(TAXONOMY_FILE):
+        try:
+            with open(TAXONOMY_FILE, encoding="utf-8") as f:
+                obj = json.load(f)
+        except (OSError, ValueError, TypeError):
+            obj = None
+    if not isinstance(obj, dict):
+        return fallback
+
+    out = {}
+    out["confidence_multiplier"] = obj.get("confidence_multiplier") if isinstance(obj.get("confidence_multiplier"), dict) else fallback["confidence_multiplier"]
+    bands = obj.get("grade_bands")
+    out["grade_bands"] = bands if isinstance(bands, list) and bands else fallback["grade_bands"]
+    fb = obj.get("grade_fallback")
+    out["grade_fallback"] = fb if isinstance(fb, str) and fb else fallback["grade_fallback"]
+    personas = obj.get("personas")
+    out["personas"] = personas if isinstance(personas, list) and personas else fallback["personas"]
+    out["classes"] = obj.get("classes") if isinstance(obj.get("classes"), dict) else fallback["classes"]
+    out["default"] = obj.get("default") if isinstance(obj.get("default"), dict) else fallback["default"]
+    out["types"] = obj.get("types") if isinstance(obj.get("types"), dict) else {}
+    return out
+
+
+def _type_info(taxonomy, t):
+    """Resolve {family, sensitivity_class, regulatory_tags, risk_weight}
+    for one detector type. Unknown type -> taxonomy's "default" entry
+    (risk_weight 3). Family prefers taxonomy.json; CATEGORY_MAP is only a
+    fallback for types taxonomy.json doesn't (yet) know about."""
+    types_map = taxonomy.get("types")
+    info = types_map.get(t) if isinstance(types_map, dict) else None
+    if not isinstance(info, dict):
+        info = taxonomy.get("default")
+    if not isinstance(info, dict):
+        info = {"family": "Other", "sensitivity_class": "pii", "regulatory_tags": [], "risk_weight": 3}
+
+    family = info.get("family")
+    if not isinstance(family, str) or not family:
+        family = categorize_type(t)
+
+    sensitivity_class = info.get("sensitivity_class")
+    if not isinstance(sensitivity_class, str) or not sensitivity_class:
+        sensitivity_class = "pii"
+
+    tags = info.get("regulatory_tags")
+    regulatory_tags = [tg for tg in tags if isinstance(tg, str) and tg] if isinstance(tags, list) else []
+
+    weight = info.get("risk_weight")
+    if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+        weight = 3
+
+    return {
+        "family": family,
+        "sensitivity_class": sensitivity_class,
+        "regulatory_tags": regulatory_tags,
+        "risk_weight": weight,
+    }
+
+
+def _confidence_multiplier(taxonomy, confidence):
+    """Weighted score = sum(risk_weight * confidence_multiplier). Unknown
+    confidence -> 0.6 (taxonomy.json's "medium" value), per spec."""
+    mult_map = taxonomy.get("confidence_multiplier")
+    m = mult_map.get(confidence) if isinstance(mult_map, dict) else None
+    if not isinstance(m, (int, float)) or isinstance(m, bool):
+        return 0.6
+    return m
+
+
+def taxonomy_grade(score, taxonomy):
+    """Letter grade = the first grade_bands entry (top to bottom) whose
+    max >= score, except A+ only matches when score == 0 exactly. If no
+    band matches, use grade_fallback. Every scoring surface (dashboard,
+    wrapped, stats, card, badge) implements this identically."""
+    bands = taxonomy.get("grade_bands")
+    if not isinstance(bands, list):
+        bands = []
+    fallback = taxonomy.get("grade_fallback")
+    if not isinstance(fallback, str) or not fallback:
+        fallback = "F"
+    for band in bands:
+        if not isinstance(band, dict):
+            continue
+        g = band.get("grade")
+        m = band.get("max")
+        if not isinstance(g, str) or not isinstance(m, (int, float)) or isinstance(m, bool):
+            continue
+        if g == "A+" and score != 0:
+            continue
+        if m >= score:
+            return g
+    return fallback
+
+
+def _persona_cond_matches(cond, ctx):
+    if cond == "clean":
+        return ctx["total"] == 0
+    if cond == "tripped":
+        return bool(ctx["tripped"])
+    if cond == "night":
+        return bool(ctx["night"])
+    if cond == "polyglot":
+        return ctx["distinct_types"] >= 12
+    if cond == "oversharer":
+        return ctx["total"] >= 100
+    if cond == "default":
+        return True
+    if isinstance(cond, str) and cond.startswith("class:"):
+        return ctx["dominant_class"] == cond[len("class:"):]
+    if isinstance(cond, str) and cond.startswith("family:"):
+        return ctx["dominant_family"] == cond[len("family:"):]
+    return False
+
+
+_FALLBACK_PERSONA = {"cond": "default", "label": "The Canary", "emoji": "\U0001F424",
+                      "blurb": "Watching what you share, one message at a time."}
+
+
+def compute_persona(records, taxonomy, now_local):
+    """context = {total, distinct_types, dominant_class, dominant_family,
+    night, tripped} per taxonomy.json's _personas algorithm. Walks
+    taxonomy["personas"] top to bottom and returns the first match."""
+    total = len(records)
+    distinct_types = len({r["type"] for r in records})
+    class_counts = Counter(r["sensitivity_class"] for r in records)
+    family_counts = Counter(r["family"] for r in records)
+    tripped = any(r["type"] == "canary_tripped" for r in records)
+
+    night_hits = 0
+    for r in records:
+        if r["dt_utc"] is None:
+            continue
+        local_dt = r["dt_utc"] + _LOCAL_OFFSET
+        if 0 <= local_dt.hour < 5:
+            night_hits += 1
+    night = total > 0 and (night_hits / total) >= 0.30
+
+    ctx = {
+        "total": total,
+        "distinct_types": distinct_types,
+        "dominant_class": class_counts.most_common(1)[0][0] if class_counts else None,
+        "dominant_family": family_counts.most_common(1)[0][0] if family_counts else None,
+        "night": night,
+        "tripped": tripped,
+    }
+
+    personas = taxonomy.get("personas")
+    if not isinstance(personas, list) or not personas:
+        personas = _default_taxonomy()["personas"]
+    for p in personas:
+        if isinstance(p, dict) and _persona_cond_matches(p.get("cond", ""), ctx):
+            return p
+    return _FALLBACK_PERSONA
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -596,6 +944,55 @@ def generate_demo_leaks():
     return records
 
 
+def generate_demo_canaries():
+    """2-3 clearly-fake canaries: 1 tripped (to show the alarming card),
+    the rest armed. Real value bytes are never used — dashboard.py never
+    reads/renders the value field anyway."""
+    now = datetime.now()
+
+    def ts(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return [
+        {
+            "id": "demo-canary-001",
+            "type": "aws_access_key",
+            "value": "«demo decoy — never a real credential»",
+            "label": "Demo decoy: fake prod-billing AWS key",
+            "planted_path": "~/.aws/credentials.canary",
+            "created_at": ts(now - timedelta(days=14)),
+            "status": "tripped",
+            "tripped_at": ts(now - timedelta(hours=5)),
+            "tripped_source": "transcript",
+            "tripped_session_id": "demo9f1c2a3b4d5e",
+        },
+        {
+            "id": "demo-canary-002",
+            "type": "github_pat",
+            "value": "«demo decoy — never a real credential»",
+            "label": "Demo decoy: fake CI deploy token",
+            "planted_path": "~/dev/example-repo/.env.canary",
+            "created_at": ts(now - timedelta(days=21)),
+            "status": "armed",
+            "tripped_at": None,
+            "tripped_source": "",
+            "tripped_session_id": "",
+        },
+        {
+            "id": "demo-canary-003",
+            "type": "db_url_credentials",
+            "value": "«demo decoy — never a real credential»",
+            "label": "Demo decoy: fake staging database URL",
+            "planted_path": "~/dev/example-repo/config/secrets.yml.canary",
+            "created_at": ts(now - timedelta(days=6)),
+            "status": "armed",
+            "tripped_at": None,
+            "tripped_source": "",
+            "tripped_session_id": "",
+        },
+    ]
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # Aggregation
 # ═════════════════════════════════════════════════════════════════════════
@@ -764,7 +1161,7 @@ def _compute_achievements(records, total, distinct_types, generated_dt_local):
 _LOCAL_OFFSET = datetime.now().astimezone().utcoffset() or timedelta(0)
 
 
-def build_aggregates(records, demo, now_local):
+def build_aggregates(records, demo, now_local, taxonomy):
     total = len(records)
     high_conf = sum(1 for r in records if r["confidence"] == "high")
     type_counts = Counter(r["type"] for r in records)
@@ -783,7 +1180,29 @@ def build_aggregates(records, demo, now_local):
     llm_count = sum(1 for r in records if r["detector"] == "llm")
     audit_count = sum(1 for r in records if r["detector"] == "audit")
 
-    grade_letter, grade_sev = risk_grade(total)
+    # ── Weighted risk score S = sum(risk_weight * confidence_multiplier) ──
+    # Each record already carries its taxonomy-resolved risk_weight,
+    # sensitivity_class, regulatory_tags and weighted_score (attached in
+    # generate_html) so this is a single pass, not a per-section recompute.
+    weighted_score = 0.0
+    per_family_weighted = Counter()
+    reg_class_counts = Counter()
+    reg_tag_counts = Counter()
+    type_risk_weight = {}
+    type_sensitivity_class = {}
+    type_family = {}
+    for r in records:
+        weighted_score += r["weighted_score"]
+        per_family_weighted[r["family"]] += r["weighted_score"]
+        reg_class_counts[r["sensitivity_class"]] += 1
+        for tag in r["regulatory_tags"]:
+            reg_tag_counts[tag] += 1
+        type_risk_weight.setdefault(r["type"], r["risk_weight"])
+        type_sensitivity_class.setdefault(r["type"], r["sensitivity_class"])
+        type_family.setdefault(r["type"], r["family"])
+
+    grade_letter = taxonomy_grade(weighted_score, taxonomy)
+    grade_sev = grade_severity(grade_letter)
 
     # type -> {regex, other} split, for category bars
     type_detector_split = {}
@@ -794,14 +1213,40 @@ def build_aggregates(records, demo, now_local):
         else:
             d["other"] += 1
 
-    # family groupings
+    # family groupings — family comes from each record's taxonomy-resolved
+    # value (already the same one summed in family_totals below), not a
+    # fresh CATEGORY_MAP lookup, so the two never disagree.
     family_totals = Counter(r["family"] for r in records)
     family_types = {}
     for t, c in type_counts.items():
-        fam = categorize_type(t)
+        fam = type_family.get(t, categorize_type(t))
         family_types.setdefault(fam, []).append((t, c))
     for fam in family_types:
         family_types[fam].sort(key=lambda tc: -tc[1])
+
+    # Lighthouse-style per-family sub-scores (0-100, higher = cleaner).
+    # See FAMILY_SUBSCORE_K comment near the top of this file for the
+    # formula and its rationale.
+    family_subscores = {}
+    for fam, s in per_family_weighted.items():
+        frac = 1.0 - (s / FAMILY_SUBSCORE_K)
+        frac = max(0.0, min(1.0, frac))
+        family_subscores[fam] = round(100 * frac)
+
+    # "Top things to stop pasting" — ranked by risk_weight * count per type,
+    # decoupled from the score itself: it explains how to improve it.
+    opportunities = []
+    for t, c in type_counts.items():
+        w = type_risk_weight.get(t, 3)
+        opportunities.append({
+            "type": t,
+            "label": human_type_label(t),
+            "count": c,
+            "sensitivity_class": type_sensitivity_class.get(t, "pii"),
+            "opp_score": w * c,
+        })
+    opportunities.sort(key=lambda o: (-o["opp_score"], -o["count"], o["type"]))
+    opportunities = opportunities[:5]
 
     # timeline
     dated = [(r["dt_utc"].date(), r["detector"] == "regex") for r in records if r["dt_utc"] is not None]
@@ -812,6 +1257,7 @@ def build_aggregates(records, demo, now_local):
     heatmap = _build_heatmap(daily_counts, now_local.date())
 
     achievements = _compute_achievements(records, total, distinct_types, now_local)
+    persona = compute_persona(records, taxonomy, now_local)
 
     # sessions top-5 / projects top-5
     session_counter = Counter(r["session_id"] for r in records if r["session_id"])
@@ -834,6 +1280,12 @@ def build_aggregates(records, demo, now_local):
         "audit_count": audit_count,
         "grade_letter": grade_letter,
         "grade_sev": grade_sev,
+        "weighted_score": weighted_score,
+        "family_subscores": family_subscores,
+        "reg_class_counts": reg_class_counts,
+        "reg_tag_counts": reg_tag_counts,
+        "opportunities": opportunities,
+        "persona": persona,
         "type_counts": type_counts,
         "type_detector_split": type_detector_split,
         "family_totals": family_totals,
@@ -848,6 +1300,7 @@ def build_aggregates(records, demo, now_local):
         "records": records,
         "demo": demo,
         "now_local": now_local,
+        "taxonomy": taxonomy,
     }
 
 
@@ -921,10 +1374,26 @@ def render_ring_gauge(agg):
       </div>"""
 
 
+def render_persona_banner(agg):
+    p = agg.get("persona") or _FALLBACK_PERSONA
+    emoji = p.get("emoji") or "\U0001F424"
+    label = p.get("label") or "The Canary"
+    blurb = p.get("blurb") or ""
+    return f"""
+  <div class="card persona-banner">
+    <span class="persona-emoji" aria-hidden="true">{esc(emoji)}</span>
+    <div class="persona-text">
+      <div class="persona-label">{esc(label)}</div>
+      <div class="persona-blurb prose">{esc(blurb)}</div>
+    </div>
+  </div>"""
+
+
 def render_hero(agg):
     letter = agg["grade_letter"]
     sev = agg["grade_sev"]
     verdict = grade_verdict(letter)
+    score_str = fmt_score(agg["weighted_score"])
 
     tiles = [
         ("High confidence", agg["high_conf"]),
@@ -947,12 +1416,186 @@ def render_hero(agg):
     </div>
     <div class="card hero-grade sev-{sev}">
       <div class="grade-letter">{esc(letter)}</div>
+      <div class="grade-score mono">S = {esc(score_str)}</div>
       <div class="grade-verdict prose">{esc(verdict)}</div>
-      <div class="grade-sub">{esc(fmt_int(agg['total']))} total &middot; risk grade</div>
+      <div class="grade-sub">{esc(fmt_int(agg['total']))} total &middot; weighted risk grade</div>
     </div>
     <div class="hero-tiles">
       {tiles_html}
     </div>
+  </div>
+  {render_persona_banner(agg)}
+</div>"""
+
+
+def _fmt_dt_local(dt_utc):
+    """dt_utc is naive-but-semantically-UTC (see _parse_timestamp). Render
+    it as an approximate local time using the same offset approximation
+    used everywhere else in this file."""
+    if dt_utc is None:
+        return None
+    local_dt = dt_utc + _LOCAL_OFFSET
+    return f"{fmt_date_short(local_dt.date())}, {local_dt.year} · {local_dt.strftime('%H:%M')}"
+
+
+def render_tripwires(canaries):
+    """Decoy tokens planted via /canary:token plant. NEVER render the raw
+    `value` field — normalize_canary() doesn't even carry it. Hidden
+    entirely (no empty skeleton) when there are no canaries at all."""
+    if not canaries:
+        return ""
+
+    tripped = [c for c in canaries if c["status"] == "tripped"]
+    armed = [c for c in canaries if c["status"] != "tripped"]
+    tripped.sort(key=lambda c: c["tripped_dt"] or datetime.min, reverse=True)
+    armed.sort(key=lambda c: c["created_dt"] or datetime.min, reverse=True)
+
+    cards = []
+    for c in tripped:
+        trip_time = _fmt_dt_local(c["tripped_dt"]) or "unknown time"
+        source = c["tripped_source"] or "unknown source"
+        session_bit = f' &middot; session <span class="mono">{esc(c["tripped_session_id"][:12])}</span>' if c["tripped_session_id"] else ""
+        planted = c["planted_path"] or "unknown location"
+        cards.append(f"""
+          <div class="tripwire-card tripwire-tripped">
+            <div class="tripwire-ribbon">⚠️ PROOF OF LEAK</div>
+            <div class="tripwire-label">{esc(c['label'])}</div>
+            <div class="tripwire-meta">
+              <div><span class="tripwire-meta-key">Planted at</span> <span class="mono">{esc(planted)}</span></div>
+              <div><span class="tripwire-meta-key">Tripped</span> {esc(trip_time)}</div>
+              <div><span class="tripwire-meta-key">Source</span> {esc(source)}{session_bit}</div>
+            </div>
+          </div>""")
+    for c in armed:
+        planted = c["planted_path"] or "unknown location"
+        created = _fmt_dt_local(c["created_dt"])
+        created_bit = f'<div><span class="tripwire-meta-key">Planted</span> {esc(created)}</div>' if created else ""
+        cards.append(f"""
+          <div class="tripwire-card tripwire-armed">
+            <div class="tripwire-status-badge">ARMED</div>
+            <div class="tripwire-label">{esc(c['label'])}</div>
+            <div class="tripwire-meta">
+              <div><span class="tripwire-meta-key">Type</span> {esc(c['type_label'])}</div>
+              <div><span class="tripwire-meta-key">Location</span> <span class="mono">{esc(planted)}</span></div>
+              {created_bit}
+            </div>
+          </div>""")
+
+    summary = f"{len(tripped)} tripped &middot; {len(armed)} armed" if tripped else f"{len(armed)} armed"
+    return f"""
+<div class="container">
+  <div class="card tripwire-section{' has-tripped' if tripped else ''}">
+    <div class="card-title-row">
+      <div class="card-title">Tripwires</div>
+      <div class="legend-note">{summary}</div>
+    </div>
+    <div class="tripwire-intro prose">Decoy secrets planted around your filesystem. If one turns up tripped below, that's not a guess &mdash; it's proof something actually read and re-exposed it.</div>
+    <div class="tripwire-grid">{''.join(cards)}</div>
+  </div>
+</div>"""
+
+
+def render_regulatory_row(agg):
+    """Compact regulatory-exposure chips: counts by sensitivity_class and
+    by regulatory tag. Tags carry their own trailing '*' from taxonomy.json
+    where the regime is "equivalent", not literal — a footnote explains it."""
+    class_counts = agg["reg_class_counts"]
+    tag_counts = agg["reg_tag_counts"]
+    if not class_counts and not tag_counts:
+        return ""
+
+    def chip(label, count, title=None):
+        title_attr = f' title="{esc(title)}"' if title else ""
+        return f'<span class="chip reg-chip"{title_attr}>{esc(label)}: {esc(fmt_int(count))}</span>'
+
+    taxonomy = agg.get("taxonomy") or {}
+    class_desc = taxonomy.get("classes") if isinstance(taxonomy.get("classes"), dict) else {}
+
+    class_chips = "".join(
+        chip(CLASS_SHORT_LABEL.get(cls, cls.replace("_", " ").title()), n, class_desc.get(cls))
+        for cls, n in class_counts.most_common()
+    )
+    tag_chips = "".join(chip(tag, n) for tag, n in tag_counts.most_common())
+
+    tag_row = f"""
+      <div class="reg-group">
+        <span class="chip-group-label">regulatory tags</span>
+        {tag_chips}
+      </div>""" if tag_chips else ""
+
+    has_starred = any(tag.endswith("*") for tag in tag_counts)
+    footnote = ('<div class="reg-footnote prose">* equivalent regime, not legal advice.</div>'
+                if has_starred else "")
+
+    return f"""
+<div class="container">
+  <div class="card reg-card">
+    <div class="card-title">Regulatory exposure</div>
+    <div class="reg-group">
+      <span class="chip-group-label">sensitivity class</span>
+      {class_chips}
+    </div>
+    {tag_row}
+    {footnote}
+  </div>
+</div>"""
+
+
+def render_lighthouse(agg):
+    """Lighthouse-style privacy report: per-family sub-scores (0-100,
+    higher = cleaner) plus a ranked, score-independent "how to improve it"
+    opportunities list."""
+    family_subscores = agg["family_subscores"]
+    opportunities = agg["opportunities"]
+    if not family_subscores and not opportunities:
+        return ""
+
+    def bucket(score):
+        if score >= _LIGHTHOUSE_GOOD_MIN:
+            return "good"
+        if score >= _LIGHTHOUSE_MID_MIN:
+            return "mid"
+        return "bad"
+
+    fam_order = sorted(family_subscores.keys(), key=lambda f: (family_subscores[f], f))
+    meter_rows = []
+    for fam in fam_order:
+        score = family_subscores[fam]
+        sev = bucket(score)
+        fam_slug = _fam_slug(fam)
+        meter_rows.append(f"""
+          <div class="lh-row">
+            <span class="pill pill-type lh-fam-label"><span class="pill-dot fam-{fam_slug}"></span>{esc(fam)}</span>
+            <span class="lh-bar-track"><span class="lh-bar lh-{sev}" style="width:{score}%"></span></span>
+            <span class="lh-score lh-score-{sev}">{esc(fmt_int(score))}</span>
+          </div>""")
+
+    taxonomy = agg.get("taxonomy") or {}
+    class_desc = taxonomy.get("classes") if isinstance(taxonomy.get("classes"), dict) else {}
+
+    opp_rows = []
+    for i, o in enumerate(opportunities, start=1):
+        cls = o["sensitivity_class"]
+        cls_label = CLASS_SHORT_LABEL.get(cls, cls.replace("_", " ").title())
+        title_attr = f' title="{esc(class_desc[cls])}"' if class_desc.get(cls) else ""
+        opp_rows.append(f"""
+          <div class="opp-row">
+            <span class="opp-rank">{i}</span>
+            <div class="opp-body">
+              <div class="opp-title">Stop pasting {esc(o['label'])}.</div>
+              <div class="opp-meta">{esc(fmt_int(o['count']))} hit{'s' if o['count'] != 1 else ''} &middot; <span class="chip opp-class"{title_attr}>{esc(cls_label)}</span></div>
+            </div>
+          </div>""")
+
+    return f"""
+<div class="container two-col">
+  <div class="card lighthouse-card">
+    <div class="card-title">Privacy report &mdash; by family</div>
+    <div class="lh-list">{''.join(meter_rows)}</div>
+  </div>
+  <div class="card opportunities-card">
+    <div class="card-title">Top things to stop pasting</div>
+    <div class="opp-list">{''.join(opp_rows)}</div>
   </div>
 </div>"""
 
@@ -1113,10 +1756,8 @@ def render_category_panel(agg, embedded=False):
     max_type_count = max(agg["type_counts"].values()) if agg["type_counts"] else 1
 
     sections = []
-    for fam in FAMILY_ORDER:
-        if family_totals.get(fam, 0) <= 0:
-            continue
-        fam_slug = fam.lower()
+    for fam in _ordered_families(family_totals):
+        fam_slug = _fam_slug(fam)
         rows = []
         for t, c in family_types.get(fam, []):
             split = type_detector_split.get(t, {"regex": 0, "other": 0})
@@ -1240,7 +1881,8 @@ def render_table_section(agg):
 </div>"""
 
 
-def render_empty_state():
+def render_empty_state(canaries=None, persona=None):
+    canaries = canaries or []
     checklist = [
         "Credit cards, bank accounts &amp; routing numbers",
         "SSNs, passports &amp; government IDs",
@@ -1250,14 +1892,34 @@ def render_empty_state():
         "Medical records &amp; legal identifiers",
     ]
     items = "".join(f'<li>{c}</li>' for c in checklist)
+
+    persona_bit = ""
+    if persona:
+        emoji = persona.get("emoji") or "\U0001F54A️"
+        label = persona.get("label") or "The Untouchable"
+        blurb = persona.get("blurb") or ""
+        persona_bit = f"""
+    <div class="persona-banner persona-banner-empty">
+      <span class="persona-emoji" aria-hidden="true">{esc(emoji)}</span>
+      <div class="persona-text">
+        <div class="persona-label">{esc(label)}</div>
+        <div class="persona-blurb prose">{esc(blurb)}</div>
+      </div>
+    </div>"""
+
+    tripwire_cta = ("" if canaries else
+                     '<div class="empty-cta prose">Plant a tripwire: <code>/canary:token plant</code> &mdash; a decoy secret that proves it if something actually reads and re-exposes it.</div>')
+
     return f"""
 <div class="container">
   <div class="empty-state">
     <div class="empty-bird">\U0001F424</div>
     <div class="empty-headline">All clear &mdash; nothing leaked yet.</div>
     <div class="empty-subline prose">Canary is watching: 30+ regex detectors + Claude self-scan on every message.</div>
+    {persona_bit}
     <ul class="empty-checklist prose">{items}</ul>
-    <div class="empty-cta prose">Try <code>/canary:scan</code> for a deep audit &mdash; or run with <code>--demo</code> to see this dashboard lit up.</div>
+    <div class="empty-cta prose">Try <code>/canary:scan</code> for a deep audit, or <code>/canary:audit</code> to check your installed skills/agents/MCP configs &mdash; or run with <code>--demo</code> to see this dashboard lit up.</div>
+    {tripwire_cta}
   </div>
 </div>"""
 
@@ -1267,6 +1929,7 @@ def render_footer():
 <div class="footer">
   <div class="footer-line">\U0001F424 CANARY &mdash; local-only &middot; zero network requests &middot; MIT</div>
   <div class="footer-line footer-dim prose">by <a href="https://sonomos.ai">Sonomos</a> &mdash; real-time PII masking before data leaves your machine &rarr; <a href="https://sonomos.ai">sonomos.ai</a></div>
+  <div class="footer-line footer-dim prose">Tip: <code>/canary:audit</code> turns this same detection engine on your installed skills, agents &amp; MCP configs.</div>
 </div>"""
 
 
@@ -1317,7 +1980,7 @@ def build_table_payload(agg):
 
     det_table = ["regex", "llm", "audit", "unknown"]
     det_index = {d: i for i, d in enumerate(det_table)}
-    conf_table = ["high", "medium", "unknown"]
+    conf_table = ["high", "medium", "low", "certain", "unknown"]
     conf_index = {c: i for i, c in enumerate(conf_table)}
 
     valid_ts = [r["dt_utc"] for r in records if r["dt_utc"] is not None]
@@ -1406,6 +2069,7 @@ CSS_TEXT = """
   --fam-technical: #935697;
   --fam-network: #c96195;
   --fam-organizational: #af5070;
+  --fam-tripwire: #f0555a;
   --fam-other: #7d8593;
 
   --heat-0: #161b22;
@@ -1447,6 +2111,7 @@ CSS_TEXT = """
   --fam-technical: #6f368b;
   --fam-network: #a04f98;
   --fam-organizational: #974a7f;
+  --fam-tripwire: #c23434;
   --fam-other: #6b7280;
 
   --heat-0: #ebe7dc;
@@ -1549,6 +2214,7 @@ a { color: var(--cyan-ink); }
 .hero-grade.sev-good .grade-letter { color: var(--good-ink); }
 .hero-grade.sev-mid .grade-letter { color: var(--amber-ink); }
 .hero-grade.sev-bad .grade-letter { color: var(--critical-ink); }
+.grade-score { font-size: 12px; color: var(--text-dim); letter-spacing: 0.3px; }
 .grade-verdict { font-size: 13px; color: var(--text-dim); }
 .grade-sub { font-size: 11px; color: var(--text-faint); }
 
@@ -1559,6 +2225,17 @@ a { color: var(--cyan-ink); }
 .stat-tile.sev-good .stat-value { color: var(--good-ink); }
 .stat-tile.sev-mid .stat-value { color: var(--amber-ink); }
 .stat-tile.sev-bad .stat-value { color: var(--critical-ink); }
+
+/* ── Persona banner ─────────────────────────────────── */
+.persona-banner {
+  margin-top: 16px; display: flex; align-items: center; gap: 16px;
+  background: linear-gradient(135deg, var(--panel) 0%, var(--panel-2) 100%);
+}
+.persona-emoji { font-size: 38px; line-height: 1; flex-shrink: 0; }
+.persona-text { min-width: 0; }
+.persona-label { font-size: 16px; font-weight: 700; color: var(--text); }
+.persona-blurb { font-size: 13px; color: var(--text-dim); margin-top: 2px; }
+.persona-banner-empty { margin: 22px auto 26px; max-width: 420px; text-align: left; }
 
 /* ── Charts ─────────────────────────────────────────── */
 .chart-a { width: 100%; height: auto; display: block; }
@@ -1612,7 +2289,11 @@ a { color: var(--cyan-ink); }
   display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text);
   padding: 3px 9px 3px 6px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-2);
 }
-.pill-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.pill-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--fam-other); }
+.fam-dot { background: var(--fam-other); }
+/* Defensive default above: any family name taxonomy.json introduces that
+   isn't one of the specific classes below still gets a visible (grey)
+   dot instead of an invisible one. */
 .fam-identity { background: var(--fam-identity); }
 .fam-financial { background: var(--fam-financial); }
 .fam-crypto { background: var(--fam-crypto); }
@@ -1621,7 +2302,65 @@ a { color: var(--cyan-ink); }
 .fam-technical { background: var(--fam-technical); }
 .fam-network { background: var(--fam-network); }
 .fam-organizational { background: var(--fam-organizational); }
+.fam-tripwire { background: var(--fam-tripwire); }
 .fam-other { background: var(--fam-other); }
+
+/* ── Tripwires ──────────────────────────────────────── */
+.tripwire-section.has-tripped { border-color: var(--critical); box-shadow: 0 0 0 1px var(--critical), var(--shadow); }
+.tripwire-intro { font-size: 12.5px; color: var(--text-dim); margin: -4px 0 14px; max-width: 720px; }
+.tripwire-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.tripwire-card { border-radius: var(--radius); padding: 14px 16px; position: relative; }
+.tripwire-armed { background: var(--panel-2); border: 1px solid var(--border); }
+.tripwire-tripped {
+  background: var(--panel-2); border: 1.5px solid var(--critical);
+  box-shadow: 0 0 0 1px var(--critical), 0 0 16px rgba(240,85,90,0.25);
+}
+.tripwire-ribbon {
+  display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: 0.6px;
+  color: var(--critical-ink); background: rgba(240,85,90,0.14); border: 1px solid var(--critical);
+  border-radius: 999px; padding: 3px 9px; margin-bottom: 8px;
+}
+.tripwire-status-badge {
+  display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: 1px;
+  color: var(--good-ink); background: rgba(61,220,132,0.12); border: 1px solid var(--good);
+  border-radius: 999px; padding: 2px 8px; margin-bottom: 8px;
+}
+.tripwire-label { font-size: 13.5px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+.tripwire-meta { font-size: 12px; color: var(--text-dim); line-height: 1.9; }
+.tripwire-meta-key { color: var(--text-faint); text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; margin-right: 4px; }
+
+/* ── Regulatory exposure ────────────────────────────── */
+.reg-group { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 6px 0; }
+.reg-chip { cursor: default; }
+.reg-chip:hover { border-color: var(--border); }
+.reg-footnote { font-size: 11px; color: var(--text-faint); margin-top: 8px; }
+
+/* ── Lighthouse privacy report ─────────────────────────*/
+.lighthouse-card, .opportunities-card { min-width: 0; }
+.lh-list { display: flex; flex-direction: column; gap: 12px; }
+.lh-row { display: flex; align-items: center; gap: 10px; }
+.lh-fam-label { flex: 0 0 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lh-bar-track { flex: 1; height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+.lh-bar { display: block; height: 100%; border-radius: 4px; }
+.lh-bar.lh-good { background: var(--good); }
+.lh-bar.lh-mid { background: var(--amber); }
+.lh-bar.lh-bad { background: var(--critical); }
+.lh-score { font-family: var(--font-mono); font-size: 13px; font-weight: 700; width: 30px; text-align: right; }
+.lh-score-good { color: var(--good-ink); }
+.lh-score-mid { color: var(--amber-ink); }
+.lh-score-bad { color: var(--critical-ink); }
+
+.opp-list { display: flex; flex-direction: column; gap: 4px; }
+.opp-row { display: flex; align-items: flex-start; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.opp-row:last-child { border-bottom: none; }
+.opp-rank {
+  flex: 0 0 22px; height: 22px; border-radius: 50%; background: var(--panel-2); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: var(--text-dim);
+}
+.opp-body { min-width: 0; }
+.opp-title { font-size: 13px; color: var(--text); font-weight: 600; }
+.opp-meta { font-size: 11.5px; color: var(--text-faint); margin-top: 3px; }
+.opp-class { padding: 1px 8px; font-size: 10.5px; cursor: default; }
 
 /* ── Achievements ───────────────────────────────────── */
 .achv-strip { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -1683,8 +2422,10 @@ a { color: var(--cyan-ink); }
 .badge-det-llm { background: rgba(79,193,233,0.15); color: var(--cyan-ink); border: 1px solid var(--cyan); }
 .badge-det-audit { background: rgba(169,155,214,0.15); color: var(--audit); border: 1px solid var(--audit); }
 .badge-det-unknown { background: var(--panel-2); color: var(--text-faint); border: 1px solid var(--border); }
+.badge-conf-certain { background: rgba(61,220,132,0.14); color: var(--good-ink); border: 1px solid var(--good); }
 .badge-conf-high { background: rgba(61,220,132,0.14); color: var(--good-ink); border: 1px solid var(--good); }
 .badge-conf-medium { background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border); }
+.badge-conf-low { background: var(--panel-2); color: var(--text-faint); border: 1px dashed var(--border); }
 .badge-conf-unknown { background: var(--panel-2); color: var(--text-faint); border: 1px solid var(--border); }
 
 .table-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; flex-wrap: wrap; gap: 10px; }
@@ -1739,6 +2480,9 @@ a { color: var(--cyan-ink); }
   .table-controls { flex-direction: column; align-items: stretch; }
   .search-input { flex: 1 1 auto; min-width: 0; }
   .chip-groups { gap: 10px; }
+  .persona-banner { flex-direction: column; text-align: center; gap: 8px; }
+  .lh-fam-label { flex-basis: 96px; }
+  .tripwire-grid { grid-template-columns: 1fr; }
 }
 
 @media print {
@@ -1936,7 +2680,13 @@ headers.forEach(function(th){
   });
 });
 
-function confRank(c){ return c === 'high' ? 2 : (c === 'medium' ? 1 : 0); }
+function confRank(c){
+  if (c === 'certain') return 3;
+  if (c === 'high') return 2;
+  if (c === 'medium') return 1;
+  if (c === 'low') return 0.5;
+  return 0;
+}
 
 function applyFilters(){
   var q = state.q.trim().toLowerCase();
@@ -2091,12 +2841,32 @@ window.addEventListener('hashchange', function(){ state = parseHash(); render();
 # ═════════════════════════════════════════════════════════════════════════
 
 
-def generate_html(raw_records, config, demo):
+def generate_html(raw_records, raw_canaries, config, demo, taxonomy=None):
+    if taxonomy is None:
+        taxonomy = load_taxonomy()
+
     records = [normalize_record(r) for r in raw_records]
     records = [r for r in records if r]
 
+    # Attach taxonomy-resolved scoring fields to every record in a single
+    # pass — family (taxonomy-preferred, CATEGORY_MAP fallback per spec),
+    # sensitivity_class, regulatory_tags, risk_weight and the per-hit
+    # weighted score. Everything downstream (score, grade, persona,
+    # regulatory exposure, lighthouse sub-scores, opportunities) reads
+    # these instead of recomputing against taxonomy.json repeatedly.
+    for r in records:
+        info = _type_info(taxonomy, r["type"])
+        r["family"] = info["family"]
+        r["sensitivity_class"] = info["sensitivity_class"]
+        r["regulatory_tags"] = info["regulatory_tags"]
+        r["risk_weight"] = info["risk_weight"]
+        r["weighted_score"] = info["risk_weight"] * _confidence_multiplier(taxonomy, r["confidence"])
+
+    canaries = [normalize_canary(c) for c in raw_canaries]
+    canaries = [c for c in canaries if c]
+
     now_local = datetime.now()
-    agg = build_aggregates(records, demo, now_local)
+    agg = build_aggregates(records, demo, now_local, taxonomy)
 
     generated_label = f"{fmt_date_short(now_local.date())}, {now_local.year} · {now_local.strftime('%H:%M')} (local)"
 
@@ -2107,10 +2877,15 @@ def generate_html(raw_records, config, demo):
     llm_warning_html = render_llm_warning() if show_llm_warning else ""
 
     if agg["total"] == 0:
-        main_html = render_empty_state()
+        clean_persona = compute_persona([], taxonomy, now_local)
+        main_html = render_empty_state(canaries, clean_persona)
+        main_html += render_tripwires(canaries)
     else:
         main_html = "".join([
             render_hero(agg),
+            render_tripwires(canaries),
+            render_regulatory_row(agg),
+            render_lighthouse(agg),
             render_chart_a(agg),
             render_chart_b(agg),
             render_achievements(agg),
@@ -2162,7 +2937,8 @@ def build_argparser():
         description="Generate Canary's self-contained HTML PII exposure dashboard.",
     )
     p.add_argument("--out", metavar="PATH", default=None,
-                    help=f"Output HTML path (default: {DEFAULT_OUTPUT_FILE})")
+                    help=f"Output HTML path (default: {DEFAULT_OUTPUT_FILE}; "
+                         f"{DEFAULT_DEMO_OUTPUT_FILE} when --demo is set without --out)")
     p.add_argument("--no-open", action="store_true",
                     help="Do not open the dashboard in a browser after generating it.")
     p.add_argument("--demo", action="store_true",
@@ -2175,19 +2951,30 @@ def build_argparser():
 def main():
     args = build_argparser().parse_args()
 
-    out_path = args.out or DEFAULT_OUTPUT_FILE
+    # Explicit --out always wins. Otherwise --demo writes to a *sibling*
+    # dashboard-demo.html, never to the real dashboard.html — --demo used
+    # to silently overwrite a user's real dashboard with fake data.
+    if args.out:
+        out_path = args.out
+    elif args.demo:
+        out_path = DEFAULT_DEMO_OUTPUT_FILE
+    else:
+        out_path = DEFAULT_OUTPUT_FILE
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
     if args.demo:
         raw_records = generate_demo_leaks()
+        raw_canaries = generate_demo_canaries()
     else:
         raw_records = load_leaks_raw(LEAKS_FILE)
+        raw_canaries = load_canaries_raw(CANARIES_FILE)
 
     config = load_config(CONFIG_FILE)
+    taxonomy = load_taxonomy()
 
-    html_doc = generate_html(raw_records, config, args.demo)
+    html_doc = generate_html(raw_records, raw_canaries, config, args.demo, taxonomy)
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html_doc)
