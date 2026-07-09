@@ -10,7 +10,7 @@ Include as much detail as possible:
 
 - Description of the vulnerability
 - Steps to reproduce
-- Affected components (regex detectors, semantic scan, dashboard, statusline, CLI tools)
+- Affected components (regex detectors, custom rules, semantic scan, Canary Tokens, dashboard, Canary Wrapped, statusline, CLI tools)
 - Potential impact
 - Any suggested fixes
 
@@ -21,7 +21,7 @@ We'll acknowledge receipt within 48 hours and aim to provide a substantive respo
 ### In Scope
 
 - **Canary plugin code** (regex detectors, semantic scan prompts, dashboard generation, statusline script, CLI tools)
-- **Detection data storage** (Canary's data directory — `${CLAUDE_PLUGIN_DATA}` when running as an installed plugin, `~/.sonomos` as the fallback — and all files within)
+- **Detection data storage** (Canary's data directory — `${CLAUDE_PLUGIN_DATA}` when running as an installed plugin, `~/.sonomos` as the fallback — and all files within, including `leaks.jsonl`, the Canary Tokens registry `canaries.jsonl`, and any user-authored rules under `rules.d/`)
 - **Plugin manifest and hooks** (`.claude-plugin/` directory)
 - **Team distribution mechanism** (marketplace registration, project-level settings)
 - **CI/CD workflows** (`.github/workflows/`)
@@ -58,6 +58,8 @@ We'll acknowledge receipt within 48 hours and aim to provide a substantive respo
 ## Data Handling
 
 Canary is designed to be fully local. All detection data is stored in Canary's data directory on the user's machine (`${CLAUDE_PLUGIN_DATA}` when running as an installed plugin, `~/.sonomos` as the fallback — see [THREAT_MODEL.md](THREAT_MODEL.md) for the trust boundary this implies). The plugin makes zero network requests. No telemetry, no analytics, no external API calls. The semantic scan runs inside Claude's own context window and does not transmit data to any service beyond what Claude Code already has access to.
+
+The data directory is created `0700` and Canary-written files in it `0600`, including `leaks.jsonl` and the Canary Tokens registry `canaries.jsonl`. A `rules.d/` directory containing your own custom detector rules lives alongside them if you've created one — Canary only ever reads it, and never writes to or `chmod`s it, so its permissions are whatever you (or your umask) gave it when you created it. `canary-badge`'s SVG output is the one deliberate exception to the `0600` rule (`0644`, since it carries only an aggregate count/grade meant to be embedded in a public README) — see THREAT_MODEL.md for the full breakdown of which output files get which permissions.
 
 Exported data (CSV, JSON) is written to the local filesystem only. The HTML dashboard is a static file generated locally and opened in the user's browser.
 

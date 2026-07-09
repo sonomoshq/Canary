@@ -19,9 +19,12 @@ bash tests/test-checksums.sh          # checksum validation (Luhn, MOD-97, ABA, 
 bash tests/test-redact.sh             # redaction format
 bash tests/test-no-false-positives.sh # false positive prevention
 bash tests/test-corpus.sh             # labeled benchmark corpus (recall / false-positive ratchet)
+bash tests/test-tokens.sh             # Canary Tokens: mint/plant/list/trips/revoke/ack + the trip detector
+bash tests/test-rotation.sh           # log rotation: archive+gzip, rollup ledger, gzip-absent degrade path
+python3 canary/scripts/custom_rules.py --selftest   # custom rules.d engine: safety measures + matching behavior
 ```
 
-All 5 suites must pass before submitting a PR.
+All 7 suites, plus `custom_rules.py --selftest`, must pass before submitting a PR.
 
 ### How the corpus ratchet works
 
@@ -71,7 +74,7 @@ Follow one of these two patterns for any new fixture that resembles a credential
 - Use `|| true` for commands that may legitimately fail (grep no-match, missing optional tool, etc.).
 - Never log raw PII values — always redact first. If a value reaches a script from outside `detectors.sh` (e.g. an LLM-reported hit), re-redact defensively rather than trusting the caller.
 - Use `jq` for JSON construction, not string interpolation — when `jq` isn't available, degrade quietly rather than crash.
-- All files written to the data directory (`${CLAUDE_PLUGIN_DATA:-~/.sonomos}`) must use `umask 0077` and end up `0700` (dirs) / `0600` (files).
+- All files written to the data directory (`${CLAUDE_PLUGIN_DATA:-~/.sonomos}`) must use `umask 0077` and end up `0700` (dirs) / `0600` (files) — this includes `canaries.jsonl` (the Canary Tokens registry) alongside `leaks.jsonl`. The one intentional exception is `canary-badge`'s SVG output (`0644` — it's meant to be embedded in a public README and carries no PII). `rules.d/*.json` rule files are the other exception in spirit: they're user-authored, and `custom_rules.py` only ever reads them — never writes to or `chmod`s that directory — so don't add code that assumes Canary controls their permissions.
 
 ## What We're Looking For
 

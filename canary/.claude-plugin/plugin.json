@@ -1,7 +1,7 @@
 {
   "name": "canary",
-  "description": "Sonomos Canary — persistent PII leak counter for Claude Code. 36 checksum-validated regex detectors plus Claude self-scan catch sensitive data you expose to AI across sessions, with an interactive dashboard, a persistent HUD, and a plugin-security audit (/canary:audit) for your installed skills, agents, and MCP configs.",
-  "version": "1.4.0",
+  "description": "Sonomos Canary — persistent PII leak counter for Claude Code. 36 checksum-validated regex detectors (plus your own via rules.d) and Claude self-scan catch sensitive data you expose to AI, Canary Tokens give a CERTAIN alarm the instant a planted decoy secret reaches Claude, and Canary Wrapped turns your exposure history into a shareable recap. Backed by a weighted risk score, an interactive dashboard, a persistent HUD, and a plugin-security audit (/canary:audit) for your installed skills, agents, and MCP configs.",
+  "version": "1.5.0",
   "author": {
     "name": "Sonomos, Inc."
   },

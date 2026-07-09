@@ -20,18 +20,35 @@ jobs:
           python3 -m json.tool canary/.claude-plugin/plugin.json > /dev/null
           echo "Validating hooks.json..."
           python3 -m json.tool canary/hooks/hooks.json > /dev/null
+          echo "Validating taxonomy.json..."
+          python3 -m json.tool canary/scripts/taxonomy.json > /dev/null
           echo "All JSON valid."
 
       - name: Check bash syntax
         run: |
           for f in canary/scripts/*.sh canary/bin/*; do
+            [[ -f "$f" ]] || continue
+            # canary-badge is a Python tool that happens to live in bin/
+            # alongside the bash CLIs — its syntax is checked in the
+            # Python syntax step below, not here: bash -n on a Python
+            # file is a guaranteed false-positive syntax error (e.g. it
+            # trips on the first `os.path.foo(...)` call), not a
+            # meaningful check of anything.
+            if head -1 "$f" | grep -q '^#!.*python'; then
+              echo "Skipping $f (Python — checked in the Python syntax step)"
+              continue
+            fi
             echo "Checking $f..."
             bash -n "$f"
           done
           echo "All bash syntax valid."
 
       - name: Check Python syntax
-        run: python3 -c "import py_compile; py_compile.compile('canary/scripts/dashboard.py', doraise=True)"
+        run: |
+          python3 -c "import py_compile; py_compile.compile('canary/scripts/dashboard.py', doraise=True)"
+          python3 -c "import py_compile; py_compile.compile('canary/scripts/wrapped.py', doraise=True)"
+          python3 -c "import py_compile; py_compile.compile('canary/scripts/custom_rules.py', doraise=True)"
+          python3 -c "import py_compile; py_compile.compile('canary/bin/canary-badge', doraise=True)"
 
       # severity:error is blocking (no continue-on-error) — a shellcheck
       # error must fail the build.
@@ -61,6 +78,26 @@ jobs:
       - name: Run corpus benchmark (recall / false-positive ratchet)
         run: bash tests/test-corpus.sh
 
+      # Canary Tokens: mint/plant/list/trips/revoke/ack, and the certain
+      # literal-match trip detector shared by scan.sh/scan-file.sh.
+      - name: Run canary tokens tests
+        run: bash tests/test-tokens.sh
+
+      # Log rotation: archive+gzip at the line/byte threshold, the rollup
+      # ledger's lifetime-total math, and the gzip-absent degrade path.
+      - name: Run log rotation tests
+        run: bash tests/test-rotation.sh
+
+      # custom_rules.py's own internal self-tests: redaction parity,
+      # validator dispatch, the catastrophic-pattern heuristic, the
+      # 250ms SIGALRM timeout, context boosting/dampening, and every rule
+      # file shape. (Also exercised as a single pass/fail line inside
+      # test-detectors.sh's own tally; this step runs it standalone so a
+      # regression here is attributed to the right file, not lumped in
+      # with the regex detector suite.)
+      - name: Run custom rules self-test
+        run: python3 canary/scripts/custom_rules.py --selftest
+
       # Generates the dashboard in --demo mode (synthetic data only, never
       # touches a real leaks.jsonl) and fails the build if the emitted HTML
       # references any external resource — the product's core "zero
@@ -75,6 +112,34 @@ jobs:
           echo "Generated $DEMO_OUT ($(wc -c < "$DEMO_OUT") bytes)"
           grep -E '(src=|@import|url\()["'"'"']?https?://' "$DEMO_OUT" && exit 1 || true
           echo "OK: no external src=/@import/url() references found."
+
+      # Same gate as above, for Canary Wrapped's --demo output.
+      - name: Build Canary Wrapped demo and verify zero external references
+        run: |
+          WRAPPED_OUT="$(mktemp -d)/canary-wrapped-demo.html"
+          python3 canary/scripts/wrapped.py --demo --no-open --out "$WRAPPED_OUT"
+          echo "Generated $WRAPPED_OUT ($(wc -c < "$WRAPPED_OUT") bytes)"
+          grep -E '(src=|@import|url\()["'"'"']?https?://' "$WRAPPED_OUT" && exit 1 || true
+          echo "OK: no external src=/@import/url() references found."
+
+      # canary-badge emits a standalone <svg>: it must be well-formed XML
+      # and must not reference anything external — no @import, no remote
+      # xlink:href/src, no url(http...). Zero network is Canary's hard
+      # rule regardless of how a given host (GitHub/GitLab/npm, ...)
+      # would otherwise sandbox an embedded SVG.
+      - name: Verify canary-badge is valid, network-free SVG
+        run: |
+          BADGE_OUT="$(mktemp -d)/canary-badge-demo.svg"
+          python3 canary/bin/canary-badge --out - > "$BADGE_OUT"
+          echo "Generated $BADGE_OUT ($(wc -c < "$BADGE_OUT") bytes)"
+          grep -qv '@import' "$BADGE_OUT"
+          grep -E '(src=|@import|xlink:href=|url\()["'"'"']?https?://' "$BADGE_OUT" && exit 1 || true
+          if command -v xmllint >/dev/null 2>&1; then
+            xmllint --noout "$BADGE_OUT"
+          else
+            python3 -c "import xml.dom.minidom as m; m.parse('$BADGE_OUT')"
+          fi
+          echo "OK: badge is well-formed SVG with no external references."
 
       # Keeps the version badge in the README from silently drifting from
       # the plugin manifest (which is what /plugin install actually reads).
@@ -145,6 +210,16 @@ jobs:
       - name: Run corpus benchmark (Perl fallback)
         run: bash tests/test-corpus.sh
 
+      # Canary Tokens' own trip detector is grep -F (fixed-string), not
+      # grep -P, but the shimmed PATH stays in effect for this whole job —
+      # exercised here too for full parity with the validate job under
+      # the BSD/Perl-fallback code path.
+      - name: Run canary tokens tests (Perl fallback)
+        run: bash tests/test-tokens.sh
+
+      - name: Run log rotation tests (Perl fallback)
+        run: bash tests/test-rotation.sh
+
   # Best-effort real-macOS leg. macOS runner capacity is not guaranteed
   # for this org (the first attempt sat queued for 15 minutes and was
   # auto-cancelled without ever starting), so this job is advisory:
@@ -165,6 +240,13 @@ jobs:
       - name: Check bash syntax
         run: |
           for f in canary/scripts/*.sh canary/bin/*; do
+            [[ -f "$f" ]] || continue
+            # canary-badge is Python (checked via py_compile on the main
+            # job's runner) — see the "validate" job for the full
+            # explanation of why bash -n can't be run against it.
+            if head -1 "$f" | grep -q '^#!.*python'; then
+              continue
+            fi
             bash -n "$f"
           done
 
@@ -175,6 +257,8 @@ jobs:
           bash tests/test-checksums.sh
           bash tests/test-no-false-positives.sh
           bash tests/test-corpus.sh
+          bash tests/test-tokens.sh
+          bash tests/test-rotation.sh
 
       - name: Build demo dashboard
         run: |
