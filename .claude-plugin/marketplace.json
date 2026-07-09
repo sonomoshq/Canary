@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Sonomos privacy plugins for Claude Code",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "plugins": [
     {
       "name": "canary",
       "source": "./canary",
-      "description": "Sonomos Canary — persistent PII leak counter. Tracks sensitive data you expose to Claude across sessions with regex + Claude self-scan detection, interactive dashboard, and a persistent terminal counter.",
+      "description": "Sonomos Canary — persistent PII leak counter. 36 checksum-validated regex detectors plus Claude self-scan track sensitive data you expose to Claude across sessions, with an interactive dashboard, a persistent HUD, and a plugin-security audit for your installed extensions.",
       "author": {
         "name": "Sonomos, Inc."
       },

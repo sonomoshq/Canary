@@ -21,7 +21,7 @@ We'll acknowledge receipt within 48 hours and aim to provide a substantive respo
 ### In Scope
 
 - **Canary plugin code** (regex detectors, semantic scan prompts, dashboard generation, statusline script, CLI tools)
-- **Detection data storage** (`~/.sonomos/` directory and all files within)
+- **Detection data storage** (Canary's data directory — `${CLAUDE_PLUGIN_DATA}` when running as an installed plugin, `~/.sonomos` as the fallback — and all files within)
 - **Plugin manifest and hooks** (`.claude-plugin/` directory)
 - **Team distribution mechanism** (marketplace registration, project-level settings)
 - **CI/CD workflows** (`.github/workflows/`)
@@ -36,7 +36,7 @@ We'll acknowledge receipt within 48 hours and aim to provide a substantive respo
 
 ## What Qualifies
 
-- Data exfiltration from `~/.sonomos/` (detection logs, dashboard data, export files)
+- Data exfiltration from Canary's data directory (detection logs, dashboard data, export files)
 - A bypass that allows PII detections to be silently suppressed or tampered with
 - Code injection via crafted input that exploits the regex engine or semantic scan parser
 - Statusline script vulnerabilities (command injection, path traversal)
@@ -48,15 +48,16 @@ We'll acknowledge receipt within 48 hours and aim to provide a substantive respo
 
 ## What Doesn't Qualify
 
-- Detection false positives or false negatives (these are accuracy issues, not security issues; post them in [Discussions](https://github.com/sonomos-ai/Canary-Plugin-Claude/discussions) instead)
+- Detection false positives or false negatives (these are accuracy issues, not security issues; post them in [Discussions](https://github.com/sonomoshq/Canary/discussions) instead)
 - Missing detection categories
 - Cosmetic issues in the dashboard
 - Vulnerabilities requiring physical access to the user's machine
 - Outdated dependency versions without a working proof of concept
+- Test fixtures that look like credentials — `tests/corpus.json` and the shell test suites use synthetic, defanged, or reserved-range values by convention (see [CONTRIBUTING.md](CONTRIBUTING.md)); none of them are real secrets
 
 ## Data Handling
 
-Canary is designed to be fully local. All detection data is stored at `~/.sonomos/` on the user's machine. The plugin makes zero network requests. No telemetry, no analytics, no external API calls. The semantic scan runs inside Claude's own context window and does not transmit data to any service beyond what Claude Code already has access to.
+Canary is designed to be fully local. All detection data is stored in Canary's data directory on the user's machine (`${CLAUDE_PLUGIN_DATA}` when running as an installed plugin, `~/.sonomos` as the fallback — see [THREAT_MODEL.md](THREAT_MODEL.md) for the trust boundary this implies). The plugin makes zero network requests. No telemetry, no analytics, no external API calls. The semantic scan runs inside Claude's own context window and does not transmit data to any service beyond what Claude Code already has access to.
 
 Exported data (CSV, JSON) is written to the local filesystem only. The HTML dashboard is a static file generated locally and opened in the user's browser.
 
@@ -84,7 +85,7 @@ We ask for a 90-day window before public disclosure if a fix is in progress.
 
 ## A Note on What Canary Handles
 
-Canary processes sensitive data by design. Its entire purpose is to detect PII in Claude Code conversations. This means the detection logs at `~/.sonomos/` will contain references to (and in some cases fragments of) the sensitive data it identified. If you have access to a user's `~/.sonomos/` directory, you have access to a record of their PII exposure.
+Canary processes sensitive data by design. Its entire purpose is to detect PII in Claude Code conversations. This means the detection logs in Canary's data directory will contain references to (and in some cases fragments of) the sensitive data it identified. If you have access to a user's Canary data directory, you have access to a record of their PII exposure.
 
 This is inherent to how the tool works, not a vulnerability. However, any issue that makes this data accessible to unauthorized parties (file permission flaws, exfiltration vectors, unintended network transmission) is absolutely in scope and should be reported.
 

@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Discussions
-    url: https://github.com/sonomos-ai/Canary/discussions
+    url: https://github.com/sonomoshq/Canary/discussions
     about: Ask questions, share ideas, or show off your dashboard
   - name: Security Vulnerability
-    url: https://github.com/sonomos-ai/Canary/blob/main/SECURITY.md
+    url: https://github.com/sonomoshq/Canary/blob/main/SECURITY.md
     about: Report security issues privately (do not open a public issue)
