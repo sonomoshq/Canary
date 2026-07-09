@@ -1,6 +1,6 @@
 # Threat Model
 
-This document describes what Canary does and doesn't protect against, where its detection layers are structurally strong versus merely probabilistic, and the residual risks we know about and haven't hidden. It covers the plugin at v1.4.0.
+This document describes what Canary does and doesn't protect against, where its detection layers are structurally strong versus merely probabilistic, and the residual risks we know about and haven't hidden. It covers the plugin at v1.5.0.
 
 ## What Canary Is (and Isn't)
 
@@ -16,7 +16,9 @@ The "LLM self-scan" layer doesn't cross this boundary either: it's a `prompt`-ty
 
 Within that local boundary, treat `leaks.jsonl` as **sensitive-adjacent, not merely diagnostic**. Values in it are redacted (first 2 + last 2 characters, `••` between), but the record still tells a reader *what categories of your data leaked, how often, roughly when, and in which project* — that's a meaningful privacy signal on its own even without the raw value, and it's why `session-start.sh`, `scan.sh`, `scan-file.sh`, `record-llm-hit.sh`, and `audit-plugins.sh` all create the data directory `0700` and every file in it `0600`. The same discipline covers the other state files (`.salt`, `.state`, `.current_session`, `config.json`, `.hud_cache`).
 
-One file does **not** get this treatment: `dashboard.py` writes `dashboard.html` with a plain `open(path, "w")` and never calls `chmod` or sets a restrictive `umask`. On a host with a permissive ambient umask (the common `022` default), the generated dashboard — which aggregates the same category/timestamp/session metadata described above into a much more readable form — ends up world-readable. This is a known gap, not a deliberate design decision, and it's the kind of thing this document exists to surface rather than paper over. If you generate the dashboard on a shared or multi-user machine, treat the output file's permissions as your responsibility until this is tightened.
+Every generated HTML report now gets the same treatment as the rest of the data directory: `dashboard.py` and `wrapped.py` both call `os.chmod(out_path, 0o600)` immediately after writing (`dashboard.html`, `dashboard-demo.html`, and `canary-wrapped.html`), regardless of the host's ambient umask. This closes a previously-documented gap in this file: an earlier release wrote the dashboard with a plain `open(path, "w")` and never called `chmod`, so a permissive `022` umask left the generated report — which aggregates the same category/timestamp/session metadata described above into a much more readable form — world-readable. If you're auditing an older install, check that the dashboard/Wrapped HTML on disk is actually `0600` before assuming it is.
+
+The one deliberate exception is `canary-badge`: its SVG output is `chmod 0644` on purpose. A badge is meant to be embedded in a public README, and it carries only an aggregate count or a letter grade — never a raw or redacted PII value — so there's nothing in it to protect the way there is in `leaks.jsonl` or the dashboard.
 
 ## What Regex Can't Catch
 
@@ -38,6 +40,20 @@ The LLM layer does not have — and cannot mechanically be given — the same gu
 
 Put directly: **we can prove the regex layer can't be talked out of matching. We cannot prove the same about the LLM layer**, and grading that with another LLM would just relocate the injection surface rather than closing it. Treat the self-scan's judgment calls as a best-effort second layer, not a guarantee — the regex layer is where the hard guarantees live.
 
+## Canary Tokens
+
+Canary Tokens (`/canary:token`, `canary-tokens.sh`) invert the trust model the rest of this document is built on: instead of guessing whether a value *looks like* a secret, Canary manufactures the value itself and waits to see it again. That's a genuinely different — and narrower — guarantee than everything else here, worth stating precisely rather than letting "certain" read as a bigger claim than it is.
+
+**What a trip actually proves.** A `canary_tripped` entry means the exact bytes Canary minted showed up somewhere `scan.sh` or `scan-file.sh` already look: a transcript message extracted on the Stop hook, or the full contents of a file touched by a `Write`/`Edit`/`NotebookEdit` tool call. `check_text_for_trips` matches with `grep -F` (literal string, never a regex) against a value nobody but Canary's own `rand_string()` could have produced — that has no false-positive mode the way a shape-guessing regex does, which is exactly why it's logged at `confidence: "certain"` rather than `high`.
+
+**What it does not prove.** A trip does not mean an *external attacker* obtained the decoy. If someone accesses the same planted file through a channel Canary doesn't instrument — they clone the repo without Claude Code ever touching it, they read the disk directly, they compromise your CI, they exfiltrate it over SSH — and that content never reaches Claude's context through a transcript or a Write/Edit/NotebookEdit tool call, Canary never sees it and never trips. Canary Tokens are a detector for "did I (or my tooling) hand this to Claude," not a general-purpose intrusion-detection or exfiltration-detection system. The `certain` confidence is about the *match*, not about the *scope of what's being watched*.
+
+**Why `confidence: "certain"` is honest here, unlike everywhere else in this document.** Every other detector is capped at `high`/`medium`/`low` because a regex match is an inference about what a value probably is — real validation limits are exactly what the "Honest Validation Limits" section below is for. A canary token's `certain` rating isn't a stronger version of that same inference; it's a different kind of claim. Canary generated this exact value and put it nowhere else, so finding it again isn't probabilistic in the way a regex match is. It's also why `revoke` simply deletes the registry record instead of introducing a third status alongside `armed`/`tripped` — a gone canary can't trip, full stop, no probability involved either way.
+
+**Pair it with a real network canarytoken for the outer perimeter.** Because a trip only fires when the decoy reaches Claude's context specifically, it says nothing about someone accessing the same file over the network, from a stolen laptop, or through a misconfigured bucket. If you want a tripwire for that outer layer too, plant a real network canarytoken (e.g. from canarytokens.org) alongside Canary's local one — Canary itself never calls out to one, or to anywhere else; it has zero network requests, full stop. The two are complementary, not redundant: one watches "did this reach Claude" (local, offline, instant), the other watches "did anything at all touch this file over the network" (external, requires its own outbound call that is deliberately not Canary's job to make).
+
+**A trip is defeated by reformatting.** The literal match means a retyped, partially-quoted, or otherwise transformed copy of a planted value can slip past it — an inherent tradeoff of certainty over shape-matching, not a bug. The regex layer would likely still catch a reformatted credit card number by shape; a canary token's exact-match layer has no shape to fall back on.
+
 ## Honest Validation Limits
 
 "36 checksum-validated detectors" is marketing shorthand for a spread of actual rigor. Being specific about where on that spread each type falls:
@@ -51,6 +67,24 @@ Put directly: **we can prove the regex layer can't be talked out of matching. We
 **Heuristic, not deterministic** — `generic_secret` fires on Shannon entropy ≥ 3.5 bits/char plus a keyword-adjacent assignment (`api_key =`, `token:`, ...). This is a real signal, but it's probabilistic: a short, memorable-but-real secret can score below the threshold, and enough random-looking text can score above it.
 
 Everything else (vendor token prefixes, JWT shape, private-key PEM headers, phone numbers, driver's licenses, MBIs, DB connection strings) is prefix/pattern matching without a checksum to validate against at all — high confidence because the shape is distinctive, not because it's cryptographically confirmed.
+
+## Custom Rules
+
+`rules.d/*.json` (`canary/scripts/custom_rules.py`) lets you add detectors for org-specific patterns without touching `detectors.sh`. Because rule files can be authored by anyone with write access to `$SONOMOS_DIR/rules.d/` — not necessarily the person who reviewed `detectors.sh` — `custom_rules.py` treats every pattern as untrusted input, not merely user-provided configuration:
+
+- Patterns are only ever passed to `re.compile()` — never `eval`'d, `exec`'d, or interpolated into another engine.
+- Hard length cap of 200 characters, enforced at load time.
+- A best-effort (not exhaustive) static heuristic rejects "obviously catastrophic" shapes at load time — a quantified group immediately re-quantified (`(a+)+`), or a quantified alternation with identical branches (`(a|a)*`).
+- The real backstop is a **250ms wall-clock timeout** per rule, via `signal.setitimer(signal.ITIMER_REAL, ...)` — the same POSIX `SIGALRM` mechanism `signal.alarm()` uses, just with sub-second granularity `alarm()` can't provide. A rule that runs past its budget is skipped for that run (with a one-time stderr warning); every other rule still executes. This is what catches the subtler ReDoS shapes (e.g. ambiguous alternation like `(a|aa)+`) the static heuristic can miss.
+- Local-only: rule files are read from disk only. `custom_rules.py` never opens a socket, matching the rest of Canary.
+
+Run `python3 canary/scripts/custom_rules.py --selftest` to see all of this exercised directly, including a live demonstration of the timeout catching a pattern the static heuristic doesn't. Full schema and worked examples in `canary/scripts/rules.d.README.md`.
+
+## Log Rotation
+
+`leaks.jsonl` rotates — archived and gzip'd when available — once it crosses 50,000 lines or 5MiB, so Canary stays fast no matter how long an install has been running. `session-start.sh` folds the rotated-out file's per-type and per-detector counts into a cumulative rollup ledger (`.rollup_ledger`, mirrored to `leaks-rollup.json`) *before* archiving, and adds that ledger's grand total back into the SessionStart banner's PII count — so the lifetime total shown there never drops across a rotation.
+
+**Known follow-up, tracked honestly rather than left implicit:** `canary-stats`, `statusline.sh`, and `dashboard.py` currently read only the *live* `leaks.jsonl` for their per-type/per-detector breakdowns and their weighted score — none of them fold the rollup ledger into those numbers yet. In practice: the SessionStart total stays lifetime-accurate through a rotation, but the dashboard's category bars, the HUD's top-3 categories, `canary-stats`'s breakdown, and every surface's weighted grade reset to reflect only what's accumulated in the live file since the most recent rotation. If you run a long-lived, heavily-used install and lean on the weighted grade or a per-type breakdown for decision-making, be aware a rotation resets that particular view even though the lifetime total keeps counting correctly.
 
 ## Known Gaps, Tracked Honestly
 
