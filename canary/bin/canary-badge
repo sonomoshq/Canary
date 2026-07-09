@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+# Copyright © 2026 Sonomos, Inc.
+# All rights reserved.
+#
+# canary-badge — Self-contained SVG badge generator for Canary's PII
+# exposure counter, in the classic shields.io / badgen "flat" left-label /
+# right-value style.
+#
+# Hard constraints:
+#   - Python 3 standard library ONLY. No third-party imports, ever.
+#   - ZERO network. No font/rendering library either — text width is sized
+#     from a small HARDCODED table of approximate Verdana-11px glyph
+#     advance widths (the same trick badge generators like badgen use to
+#     lay a badge out without shelling out to a rasterizer). The glyphs
+#     themselves are drawn by whichever of "Verdana, Geneva, DejaVu Sans,
+#     sans-serif" the SVG viewer resolves — but every <text> element pins
+#     textLength/lengthAdjust="spacing" so the rendered run always fills
+#     exactly the box our table sized for it, regardless of which of those
+#     fonts is actually installed.
+#   - Output is a single standalone <svg>: no <image>, no xlink:href, no
+#     @import, no remote font/script/stylesheet references.
+#   - Must never crash on malformed or missing leaks.jsonl / taxonomy.json
+#     — every field read is defensive, matching dashboard.py's contract.
+#
+# Usage: canary-badge [--metric count|grade] [--label TEXT] [--out PATH|-]
+#                      [--style flat] [--help]
+
+import argparse
+import json
+import os
+import sys
+from xml.sax.saxutils import escape as _xml_escape
+
+# ═════════════════════════════════════════════════════════════════════════
+# Paths
+# ═════════════════════════════════════════════════════════════════════════
+
+SONOMOS_DIR = os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.expanduser("~/.sonomos")
+LEAKS_FILE = os.path.join(SONOMOS_DIR, "leaks.jsonl")
+DEFAULT_OUT = os.path.join(SONOMOS_DIR, "canary-badge.svg")
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Installed plugin layout is canary/bin/canary-badge next to
+# canary/scripts/taxonomy.json. A couple of alternate candidates are
+# checked too so this keeps working if the layout ever shifts slightly;
+# if none exist we degrade to an unweighted score rather than fail.
+TAXONOMY_CANDIDATES = [
+    os.path.join(SCRIPT_DIR, "..", "scripts", "taxonomy.json"),
+    os.path.join(SCRIPT_DIR, "scripts", "taxonomy.json"),
+    os.path.join(SCRIPT_DIR, "taxonomy.json"),
+]
+
+# ═════════════════════════════════════════════════════════════════════════
+# Hardcoded Verdana ~11px glyph advance-width table (approximate metrics,
+# in px). This is NOT extracted from any font file — it is a hand-tuned
+# approximation (narrow "i"/"l"/"."  vs wide "M"/"W"/"@", tabular digits)
+# good enough to size a badge sensibly without a rendering library. Any
+# character outside the table (unicode, emoji, control chars) falls back
+# to DEFAULT_CHAR_WIDTH.
+# ═════════════════════════════════════════════════════════════════════════
+
+DEFAULT_CHAR_WIDTH = 7.0
+
+VERDANA_11PX_WIDTHS = {
+    " ": 3.5, "!": 4.0, '"': 5.0, "#": 8.0, "$": 7.0, "%": 11.5, "&": 8.5,
+    "'": 3.0, "(": 5.0, ")": 5.0, "*": 6.0, "+": 8.0, ",": 4.0, "-": 5.0,
+    ".": 4.0, "/": 4.5,
+    "0": 7.0, "1": 7.0, "2": 7.0, "3": 7.0, "4": 7.0, "5": 7.0, "6": 7.0,
+    "7": 7.0, "8": 7.0, "9": 7.0,
+    ":": 4.0, ";": 4.0, "<": 8.0, "=": 8.0, ">": 8.0, "?": 6.5, "@": 12.0,
+    "A": 8.0, "B": 8.0, "C": 8.5, "D": 9.0, "E": 7.5, "F": 6.5, "G": 9.5,
+    "H": 9.0, "I": 4.0, "J": 5.0, "K": 8.0, "L": 6.5, "M": 10.5, "N": 9.0,
+    "O": 9.5, "P": 7.5, "Q": 9.5, "R": 8.0, "S": 8.0, "T": 7.0, "U": 9.0,
+    "V": 8.0, "W": 11.5, "X": 8.0, "Y": 8.0, "Z": 7.5,
+    "[": 4.5, "\\": 4.5, "]": 4.5, "^": 7.0, "_": 6.5, "`": 7.0,
+    "a": 7.0, "b": 7.0, "c": 6.0, "d": 7.0, "e": 7.0, "f": 4.0, "g": 7.0,
+    "h": 7.0, "i": 3.0, "j": 3.0, "k": 6.5, "l": 3.0, "m": 10.5, "n": 7.0,
+    "o": 7.0, "p": 7.0, "q": 7.0, "r": 5.0, "s": 6.0, "t": 4.5, "u": 7.0,
+    "v": 6.5, "w": 9.0, "x": 6.5, "y": 6.5, "z": 6.0,
+    "{": 5.0, "|": 4.0, "}": 5.0, "~": 8.0,
+}
+
+
+def text_width(s):
+    """Sum of hardcoded glyph widths. Unknown glyphs (unicode/emoji/etc.)
+    fall back to DEFAULT_CHAR_WIDTH so input outside the table still
+    sizes sanely instead of collapsing to zero."""
+    return sum(VERDANA_11PX_WIDTHS.get(ch, DEFAULT_CHAR_WIDTH) for ch in s)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Fallback taxonomy defaults — used only when taxonomy.json can't be found
+# or parsed. Mirrors taxonomy.json's own "_scoring" contract (grade bands,
+# confidence multipliers, catch-all risk weight) so a degraded badge still
+# grades on the same scale as every other Canary surface, just without
+# per-type weighting for unrecognized types.
+# ═════════════════════════════════════════════════════════════════════════
+
+FALLBACK_GRADE_BANDS = [
+    {"grade": "A+", "max": 0},
+    {"grade": "A", "max": 8},
+    {"grade": "B", "max": 25},
+    {"grade": "C", "max": 75},
+    {"grade": "D", "max": 250},
+]
+FALLBACK_GRADE_FALLBACK = "F"
+FALLBACK_CONFIDENCE_MULTIPLIER = {"high": 1.0, "medium": 0.6, "low": 0.3, "certain": 1.0}
+FALLBACK_DEFAULT_RISK_WEIGHT = 3
+
+
+def load_taxonomy():
+    for path in TAXONOMY_CANDIDATES:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def load_leaks_raw(path):
+    """Read leaks.jsonl, tolerating blank lines and broken JSON — same
+    contract as dashboard.py's load_leaks_raw."""
+    if not path or not os.path.exists(path):
+        return []
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except OSError:
+        return []
+    return out
+
+
+def compute_score(records, taxonomy):
+    """Weighted risk score S = sum(risk_weight * confidence_multiplier)
+    over every hit, per taxonomy.json's _scoring contract. Degrades to the
+    fallback catch-all risk weight for every hit when taxonomy.json is
+    unavailable (still confidence-weighted, just not per-type)."""
+    if isinstance(taxonomy, dict) and isinstance(taxonomy.get("types"), dict):
+        types = taxonomy["types"]
+        default_entry = taxonomy.get("default")
+        default_weight = FALLBACK_DEFAULT_RISK_WEIGHT
+        if isinstance(default_entry, dict):
+            default_weight = default_entry.get("risk_weight", FALLBACK_DEFAULT_RISK_WEIGHT)
+        conf_mult = taxonomy.get("confidence_multiplier")
+        if not isinstance(conf_mult, dict):
+            conf_mult = FALLBACK_CONFIDENCE_MULTIPLIER
+    else:
+        types = {}
+        default_weight = FALLBACK_DEFAULT_RISK_WEIGHT
+        conf_mult = FALLBACK_CONFIDENCE_MULTIPLIER
+
+    score = 0.0
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        t = rec.get("type")
+        conf = rec.get("confidence")
+        entry = types.get(t) if isinstance(t, str) else None
+        weight = entry.get("risk_weight", default_weight) if isinstance(entry, dict) else default_weight
+        mult = conf_mult.get(conf, 1.0) if isinstance(conf, str) else 1.0
+        try:
+            score += float(weight) * float(mult)
+        except (TypeError, ValueError):
+            score += float(default_weight)
+    return score
+
+
+def grade_for_score(score, taxonomy):
+    """First grade_bands entry (top to bottom) whose max >= S; F fallback
+    if S exceeds every band. Weights/multipliers are never negative, so
+    this naturally satisfies "A+ only if S==0 exactly" without a special
+    case (A+'s own band max is 0)."""
+    bands = taxonomy.get("grade_bands") if isinstance(taxonomy, dict) else None
+    fallback = taxonomy.get("grade_fallback") if isinstance(taxonomy, dict) else None
+    if not isinstance(bands, list) or not bands:
+        bands = FALLBACK_GRADE_BANDS
+    if not isinstance(fallback, str) or not fallback:
+        fallback = FALLBACK_GRADE_FALLBACK
+    for band in bands:
+        if not isinstance(band, dict):
+            continue
+        try:
+            band_max = float(band.get("max", -1))
+        except (TypeError, ValueError):
+            continue
+        if band_max >= score:
+            grade = band.get("grade")
+            return grade if isinstance(grade, str) and grade else fallback
+    return fallback
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Colors (shields.io-standard flat palette) + severity selection
+# ═════════════════════════════════════════════════════════════════════════
+
+COLOR_LABEL_BG = "#555"
+COLOR_GREEN = "#4c1"
+COLOR_AMBER = "#dfb317"
+COLOR_RED = "#e05d44"
+
+
+def severity_color(metric, count, grade):
+    if metric == "grade":
+        if grade in ("A+", "A"):
+            return COLOR_GREEN
+        if grade in ("B", "C"):
+            return COLOR_AMBER
+        return COLOR_RED  # D, F, or anything unrecognized
+    # metric == "count"
+    if count == 0:
+        return COLOR_GREEN
+    if count < 25:
+        return COLOR_AMBER
+    return COLOR_RED
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# SVG rendering
+# ═════════════════════════════════════════════════════════════════════════
+
+def build_svg(label, value_text, color):
+    label = label if isinstance(label, str) else str(label)
+    value_text = value_text if isinstance(value_text, str) else str(value_text)
+
+    pad = 5.0    # horizontal padding either side of each text run, in px
+    height = 20
+    font_size = 11
+    min_box_w = 20  # keeps an empty label/value from collapsing to 0 width
+
+    label_tw = text_width(label)
+    value_tw = text_width(value_text)
+    label_w = max(round(label_tw + 2 * pad), min_box_w)
+    value_w = max(round(value_tw + 2 * pad), min_box_w)
+    total_w = label_w + value_w
+
+    label_cx = label_w / 2.0
+    value_cx = label_w + value_w / 2.0
+
+    esc_label = _xml_escape(label)
+    esc_value = _xml_escape(value_text)
+    esc_full = _xml_escape(f"{label}: {value_text}")
+
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{total_w}" height="{height}" role="img" aria-label="{esc_full}">
+<title>{esc_full}</title>
+<linearGradient id="canary-badge-sheen" x2="0" y2="100%">
+<stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+<stop offset="1" stop-opacity=".1"/>
+</linearGradient>
+<clipPath id="canary-badge-round">
+<rect width="{total_w}" height="{height}" rx="3" fill="#fff"/>
+</clipPath>
+<g clip-path="url(#canary-badge-round)">
+<rect width="{label_w}" height="{height}" fill="{COLOR_LABEL_BG}"/>
+<rect x="{label_w}" width="{value_w}" height="{height}" fill="{color}"/>
+<rect width="{total_w}" height="{height}" fill="url(#canary-badge-sheen)"/>
+</g>
+<g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="{font_size}" text-rendering="geometricPrecision">
+<text x="{label_cx:.1f}" y="14" fill="#010101" fill-opacity=".3" textLength="{label_tw:.1f}" lengthAdjust="spacing">{esc_label}</text>
+<text x="{label_cx:.1f}" y="13" textLength="{label_tw:.1f}" lengthAdjust="spacing">{esc_label}</text>
+<text x="{value_cx:.1f}" y="14" fill="#010101" fill-opacity=".3" textLength="{value_tw:.1f}" lengthAdjust="spacing">{esc_value}</text>
+<text x="{value_cx:.1f}" y="13" textLength="{value_tw:.1f}" lengthAdjust="spacing">{esc_value}</text>
+</g>
+</svg>
+'''
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# CLI
+# ═════════════════════════════════════════════════════════════════════════
+
+def build_argparser():
+    p = argparse.ArgumentParser(
+        prog="canary-badge",
+        description="Generate a self-contained shields-style SVG badge for "
+                     "Canary's PII exposure count or weighted grade.",
+    )
+    p.add_argument("--metric", choices=["count", "grade"], default="count",
+                    help='Badge metric: raw PII count or weighted letter grade (default: count)')
+    p.add_argument("--label", default="Canary", metavar="TEXT",
+                    help='Left-side badge label (default: "Canary")')
+    p.add_argument("--out", default=None, metavar="PATH",
+                    help=f'Output SVG path, or "-" for stdout (default: {DEFAULT_OUT})')
+    p.add_argument("--style", choices=["flat"], default="flat",
+                    help="Badge style (only 'flat' is implemented)")
+    return p
+
+
+def main(argv=None):
+    args = build_argparser().parse_args(argv)
+
+    records = load_leaks_raw(LEAKS_FILE)
+    taxonomy = load_taxonomy()
+    count = len(records)
+
+    score = compute_score(records, taxonomy)
+    grade = grade_for_score(score, taxonomy)
+
+    if args.metric == "grade":
+        value_text = f"grade: {grade}"
+        color = severity_color("grade", count, grade)
+    else:
+        value_text = f"{count} PII"
+        color = severity_color("count", count, grade)
+
+    svg = build_svg(args.label, value_text, color)
+
+    out = args.out or DEFAULT_OUT
+    if out == "-":
+        sys.stdout.write(svg)
+        return 0
+
+    out_dir = os.path.dirname(out)
+    if out_dir:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            print(f"canary-badge: could not create output directory: {e}", file=sys.stderr)
+            return 1
+
+    tmp = f"{out}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(svg)
+        # A badge is meant to be embedded/shared, not secret — it carries
+        # only an aggregate count/grade, never raw PII values — so unlike
+        # the rest of $SONOMOS_DIR it's world-readable.
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, out)
+    except OSError as e:
+        print(f"canary-badge: failed to write {out}: {e}", file=sys.stderr)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return 1
+
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
