@@ -197,6 +197,22 @@
       "expected_miss": false
     },
     {
+      "id": "prose-mailto-link",
+      "surface": "prose",
+      "text": "For any billing questions, email us at mailto:accounts@westfield-supply.io and we'll follow up.",
+      "gold": [ { "value": "accounts@westfield-supply.io", "type": "email" } ],
+      "preserve": [],
+      "expected_miss": false
+    },
+    {
+      "id": "nearmiss-placeholder-context-not-hard-excluded",
+      "surface": "near-miss",
+      "text": "e.g. a sample invoice used card 4532015112830366 for testing purposes only",
+      "gold": [ { "value": "4532015112830366", "type": "credit_card" } ],
+      "preserve": [],
+      "expected_miss": false
+    },
+    {
       "id": "leakage-github-and-slack",
       "surface": "leakage",
       "text": "found in the old deploy script:\nGITHUB_TOKEN=ghp___X__Kq82PVWHpE7fYOROTEDuEabrZEv4ADjwANXg\nSLACK_WEBHOOK=https://hooks.slack.com/services/__X__T0KuaBk3j8/B08QcTzFzu/P402hn4iSt5Bjy3plfyHkmKE\n",

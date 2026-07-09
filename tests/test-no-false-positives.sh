@@ -52,6 +52,31 @@ assert_type_absent() {
   fi
 }
 
+# Verifies negative-context dampening: the hit must still be PRESENT (at
+# a lower confidence tier), not dropped. A plain assert_no_detect would
+# be satisfied by either a dropped hit or a wrong-confidence hit; this
+# checks the (type, confidence) pair together so a regression that
+# accidentally suppresses the hit instead of dampening it is caught too.
+assert_confidence() {
+  local label="$1"
+  local input="$2"
+  local expected_type="$3"
+  local expected_conf="$4"
+
+  local output
+  output=$(bash "$DETECTORS" "$input" 2>/dev/null || true)
+
+  if echo "$output" | grep -q "\"type\":\"$expected_type\".*\"confidence\":\"$expected_conf\""; then
+    PASS=$((PASS + 1))
+    echo "  PASS: $label"
+  else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: $label (expected type '$expected_type' at confidence '$expected_conf')"
+    echo "        input: $input"
+    echo "        output: $output"
+  fi
+}
+
 echo "=== Code Variable Names ==="
 assert_no_detect "Variable email" 'email_address = "placeholder"'
 assert_no_detect "Function name" "def validate_credit_card(number):"
@@ -128,6 +153,31 @@ echo "=== Generic Secret Entropy Gate ==="
 assert_no_detect "Low-entropy placeholder password" "password = changeme"
 assert_no_detect "Low-entropy dictionary-word token" "token = mytokenvalue"
 assert_no_detect "All-lowercase sequential value (high entropy but not secret-shaped)" "api_key = abcdefghijklmnop"
+
+echo ""
+echo "=== Negative-Context Confidence Dampening (research idea: dampen, don't drop) ==="
+# These values are real, otherwise-valid hits (correct Luhn/mod-97
+# checksums, well-formed phone shape) sitting on a line with a
+# placeholder/example-ish word nearby. Canary's threat model says
+# undercounting is the failure that matters, so the dampener must NEVER
+# drop these outright — it may only lower confidence one tier. Each
+# assertion below checks the (type, confidence) pair, which fails both
+# if the hit disappears AND if the confidence didn't move.
+assert_confidence "Credit card near 'example' downgraded high -> medium (still detected)" \
+  "example use only: card number 4532015112830366 for the demo" "credit_card" "medium"
+assert_confidence "IBAN near 'changeme' downgraded high -> medium (still detected)" \
+  "changeme placeholder value DE89370400440532013000 unused" "iban" "medium"
+assert_confidence "Phone number near 'dummy' downgraded medium -> low (still detected)" \
+  "dummy sandbox number: 415-627-8830" "phone_number" "low"
+assert_confidence "Credit card far from 'example' (outside the ~40-char window) stays 'high'" \
+  "example use only: this paragraph is padded out with enough filler words that the number lands well outside any reasonable proximity window. card number 4532015112830366" "credit_card" "high"
+
+# Exact-literal placeholder denylist (is_placeholder()) is unrelated to
+# the proximity dampener and still drops these outright, unchanged —
+# already covered above under "Placeholder / Documentation Values
+# Suppressed (denylist)", re-asserted here for contrast with dampening.
+assert_no_detect "Exact-literal placeholder PAN is still fully dropped, not just dampened" \
+  "example card: 4111111111111111"
 
 echo ""
 echo "==============================="

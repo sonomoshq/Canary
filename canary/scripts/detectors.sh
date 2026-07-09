@@ -5,7 +5,13 @@
 # detectors.sh — Regex-based PII detection with checksum validation.
 # Takes text on $1, outputs JSONL hits to stdout.
 # Each hit: {"type":"<category>","value":"<redacted>","detector":"regex",
-#            "confidence":"high|medium","value_id":"<12 hex chars, optional>"}
+#            "confidence":"high|medium|low","value_id":"<12 hex chars, optional>"}
+#
+# Confidence can be downgraded one tier (high->medium, medium->low) by the
+# negative-context dampener below when a hit lands near words like
+# "example"/"dummy"/"changeme" — see HAS_NEG_CTX / context_window(). This
+# never drops a hit outright (undercounting is the failure that matters —
+# see THREAT_MODEL.md); it only de-emphasizes the weighted score.
 #
 # Portability: Works on both GNU grep (Linux) and BSD grep (macOS).
 # Falls back to Perl when grep -P is unavailable. Bash 3.2 compatible:
@@ -185,12 +191,73 @@ compute_value_id() {
   printf '%s' "$digest"
 }
 
-# ── emit: single JSON-emission path (placeholder gate, dedup, redact,
-#          value_id, print). All detectors funnel through this. ───────
+# ── Utility: one-tier confidence downgrade (high->medium->low->low) ──
+# Prints to stdout (usable as `x=$(downgrade_confidence "$x")`) for
+# external callers/tests. emit()'s own hot path below does NOT call this
+# via a subshell — it inlines the same 3-line case statement directly —
+# since it runs on every dampened hit and a fork is avoidable there. Kept
+# here as a standalone, testable utility so the mapping has one
+# authoritative definition to read (and this exact function body is what
+# any future extraction-based test would target, matching the redact()/
+# luhn_valid() convention elsewhere in this file).
+downgrade_confidence() {
+  case "$1" in
+    high) printf 'medium' ;;
+    medium) printf 'low' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# ── Utility: ~40-char context window around the first occurrence of a
+#             literal substring of $TEXT (used for negative-context
+#             confidence dampening — see emit()). "token" MUST be a
+#             literal substring of $TEXT (e.g. the raw $match a detector
+#             just pulled out of it via pgrep_o/pgrep_oi, or a whole
+#             $line for detectors that already loop line-by-line) — NOT
+#             a post-processed value like dash-stripped digits, which
+#             may no longer appear verbatim in $TEXT. Quoting "$token"
+#             inside the ${TEXT%%...} pattern makes bash treat it as a
+#             literal string rather than a glob, per standard bash
+#             parameter-expansion semantics. Falls back to the token
+#             itself (never dampens) if it isn't found verbatim — safe,
+#             since that just skips the confidence downgrade.
+#
+# Sets the global CTX_WINDOW_RESULT rather than printing+being called via
+# "$(...)" — this runs once per HIT (not once per invocation), so it
+# deliberately avoids the subshell/fork a command substitution would cost.
+context_window() {
+  local token="$1"
+  CTX_WINDOW_RESULT=""
+  [[ -z "$token" ]] && return 0
+  case "$TEXT" in
+    *"$token"*) : ;;
+    *) CTX_WINDOW_RESULT="$token"; return 0 ;;
+  esac
+  local prefix="${TEXT%%"$token"*}"
+  local plen=${#prefix}
+  local start=$(( plen - 40 ))
+  [[ $start -lt 0 ]] && start=0
+  local pre="${TEXT:$start:$((plen - start))}"
+  local after_start=$(( plen + ${#token} ))
+  local post="${TEXT:$after_start:40}"
+  CTX_WINDOW_RESULT="${pre}${token}${post}"
+}
+
+# ── emit: single JSON-emission path (placeholder gate, dedup, negative-
+#          context dampening, redact, value_id, print). All detectors
+#          funnel through this. ───────────────────────────────────────
 SEEN_KEYS=$'\x1e'
 
+# emit <type> <raw-value> <confidence> [context-token]
+#
+# context-token, when given, is used ONLY for the negative-context
+# dampening check (see context_window() above) — it must be a literal
+# substring of $TEXT, not a transformed value like $digits or $clean.
+# Every call site below passes the detector's own $match (or, for the
+# few detectors that already loop line-by-line, $line — an equally
+# literal, and more complete, substring of $TEXT).
 emit() {
-  local type="$1" raw="$2" conf="$3"
+  local type="$1" raw="$2" conf="$3" ctx_token="${4:-}"
 
   is_placeholder "$raw" && return 0
 
@@ -199,6 +266,23 @@ emit() {
     *"$key"*) return 0 ;;
   esac
   SEEN_KEYS="${SEEN_KEYS}${key}"
+
+  # Negative-context dampening: never drops a hit (undercounting is the
+  # failure that matters), only lowers confidence one tier so the
+  # weighted score de-emphasizes probable placeholders/examples. Gated
+  # on HAS_NEG_CTX (computed once for the whole $TEXT) so texts with none
+  # of these words never pay for the per-hit window lookup. Both
+  # context_window() and the [[ =~ ]] match below are fork-free (see
+  # their comments) since this runs once per hit.
+  if [[ $HAS_NEG_CTX -eq 1 && -n "$ctx_token" ]]; then
+    context_window "$ctx_token"
+    if [[ "$CTX_WINDOW_RESULT" =~ $NEG_CTX_PATTERN ]]; then
+      case "$conf" in
+        high) conf="medium" ;;
+        medium) conf="low" ;;
+      esac
+    fi
+  fi
 
   local red
   if [[ "$type" == "private_key_block" ]]; then
@@ -431,6 +515,38 @@ case "$TEXT" in *AKIA*|*ASIA*|*ABIA*|*ACCA*|*[Aa][Ww][Ss]*) HAS_AWS=1 ;; esac
 HAS_LICENSE=0
 case "$TEXT" in *[Ll][Ii][Cc][Ee][Nn]*) HAS_LICENSE=1 ;; esac
 
+# Cheap superset glob for the negative-context dampening word list (see
+# NEG_CTX_PATTERN / context_window() below). This is deliberately looser
+# than the real \b-bounded regex (e.g. it also matches "resample", which
+# the real check won't) — that's fine, it only gates whether we bother
+# computing a per-hit context window at all. Every string the precise
+# regex can match also matches one of these globs, so this adds no
+# false-negative risk, just lets texts with none of these words skip the
+# per-hit work entirely.
+HAS_NEG_CTX=0
+case "$TEXT" in
+  *[Ee][Xx][Aa][Mm][Pp][Ll][Ee]*|*[Ss][Aa][Mm][Pp][Ll][Ee]*|*[Dd][Uu][Mm][Mm][Yy]*| \
+  *[Pp][Ll][Aa][Cc][Ee][Hh][Oo][Ll][Dd][Ee][Rr]*|*[Ee].[Gg]*|*[Ll][Oo][Rr][Ee][Mm]*| \
+  *[Ii][Pp][Ss][Uu][Mm]*|*[Rr][Ee][Dd][Aa][Cc][Tt][Ee][Dd]*|*[Xx][Xx][Xx][Xx]*| \
+  *[Yy][Oo][Uu][Rr]_*|*[Mm][Yy]_*|*[Tt][Oo][Dd][Oo]*|*[Ff][Ii][Xx][Mm][Ee]*| \
+  *[Cc][Hh][Aa][Nn][Gg][Ee][Mm][Ee]*|*[Tt][Ee][Ss][Tt]-[Oo][Nn][Ll][Yy]*|*[Ff][Aa][Kk][Ee]*)
+    HAS_NEG_CTX=1 ;;
+esac
+# Precise, \b-bounded pattern re-checked per-hit (only reached when the
+# cheap glob above already passed). Matched via bash's own [[ =~ ]] (glibc
+# ERE, no subshell/fork) rather than pgrep_oi — this runs once per HIT,
+# not once per invocation, so avoiding a fork here matters. Case-folding
+# is spelled out per-letter with bracket expressions instead of `shopt -s
+# nocasematch`, deliberately: that shopt is global for the rest of the
+# script's process lifetime and several OTHER =~ checks below rely on
+# case-SENSITIVE matching (e.g. generic_secret's `[[ "$value" =~
+# ^[a-z]+$ ]]` — turning on nocasematch would make that match mixed-case
+# secrets too and silently suppress them). "your_"/"my_" and "x{4,}"
+# deliberately have no trailing \b — they're meant to catch prefixes like
+# "your_email_here" and runs like "XXXXXXXX", not just a literal token
+# standing alone.
+NEG_CTX_PATTERN='\b([Ee][Xx][Aa][Mm][Pp][Ll][Ee]|[Ss][Aa][Mm][Pp][Ll][Ee]|[Dd][Uu][Mm][Mm][Yy]|[Pp][Ll][Aa][Cc][Ee][Hh][Oo][Ll][Dd][Ee][Rr]|[Ll][Oo][Rr][Ee][Mm]|[Ii][Pp][Ss][Uu][Mm]|[Rr][Ee][Dd][Aa][Cc][Tt][Ee][Dd]|[Tt][Oo][Dd][Oo]|[Ff][Ii][Xx][Mm][Ee]|[Cc][Hh][Aa][Nn][Gg][Ee][Mm][Ee]|[Ff][Aa][Kk][Ee]|[Tt][Ee][Ss][Tt]-[Oo][Nn][Ll][Yy])\b|[Ee]\.[Gg]\.?|[Xx]{4,}|[Yy][Oo][Uu][Rr]_|[Mm][Yy]_'
+
 # ══════════════════════════════════════════════════════════════════════
 # DETECTORS
 # ══════════════════════════════════════════════════════════════════════
@@ -440,7 +556,7 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
   while IFS= read -r match; do
     clean="${match//[- ]/}"
     if [[ ${#clean} -ge 13 && ${#clean} -le 19 ]] && luhn_valid "$clean"; then
-      emit "credit_card" "$clean" "high"
+      emit "credit_card" "$clean" "high" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_o '\b(?:\d[ -]?){13,19}\b')
 fi
@@ -449,6 +565,23 @@ fi
 # Require: 2+ char local part, real domain with dot, 2-12 char TLD
 # Exclude: URL userinfo (preceded by ://), common false positives, and
 # RFC 2606 reserved documentation domains/TLDs (example.com, .test, ...)
+#
+# The boundary used to be a single lookbehind, (?<![:/@]), applied to the
+# WHOLE match start. That's wrong on two counts at once: it blocks a
+# "mailto:" prefix from ever matching (the local part starts right after
+# a ':', so the lookbehind vetoes the only valid start position — either
+# ZERO detection when the local part has no interior '.', e.g.
+# "mailto:foo@bar.com", or a TRUNCATED match when it does, e.g.
+# "mailto:jane.smith@x.com" matching only "smith@x.com" because "smith"
+# is the first substring after a '.' that both starts a \b word boundary
+# and isn't immediately preceded by ':'). Fix: allow the match to start
+# either right after a literal "mailto:" prefix, OR anywhere the original
+# exclusion applies (not preceded by ':', '/', '@'). Both lookbehind
+# branches are fixed-width (7 chars / 1 char), which PCRE and Perl both
+# support in an alternation even though the two branches differ in
+# length. This still blocks the original target — "pass" in
+# "https://user:pass@host" is preceded by ':' and isn't preceded by a
+# literal "mailto:", so neither branch fires and it still doesn't match.
 if [[ $HAS_AT -eq 1 ]]; then
   while IFS= read -r match; do
     local_part="${match%%@*}"
@@ -460,15 +593,15 @@ if [[ $HAS_AT -eq 1 ]]; then
       example.com|example.net|example.org) continue ;;
       *.test|*.invalid|*.localhost) continue ;;
     esac
-    emit "email" "$match" "high"
-  done < <(echo "$TEXT" | pgrep_oi '(?<![:/@])\b[a-z0-9][a-z0-9._%+\-]{0,62}[a-z0-9]@[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)*\.[a-z]{2,12}\b')
+    emit "email" "$match" "high" "$match"
+  done < <(echo "$TEXT" | pgrep_oi '(?:(?<=mailto:)|(?<![:/@]))\b[a-z0-9][a-z0-9._%+\-]{0,62}[a-z0-9]@[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)*\.[a-z]{2,12}\b')
 fi
 
 # ── 3. IBAN ──────────────────────────────────────────────────────────
 if [[ $HAS_DIGIT -eq 1 ]]; then
   while IFS= read -r match; do
     if mod97_valid "$match"; then
-      emit "iban" "$match" "high"
+      emit "iban" "$match" "high" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_o '\b[A-Z]{2}\d{2}[ ]?[\dA-Z]{4}[ ]?[\dA-Z]{4}[ ]?[\dA-Z]{4}[ ]?[\dA-Z]{0,16}\b')
 fi
@@ -478,7 +611,7 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
   while IFS= read -r match; do
     # Exclude non-PII: private, loopback, link-local, multicast, broadcast, documentation
     if [[ ! "$match" =~ ^(127\.|0\.|255\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|224\.|225\.|226\.|227\.|228\.|229\.|23[0-9]\.|24[0-9]\.|25[0-4]\.|169\.254\.|198\.51\.100\.|203\.0\.113\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]] && [[ "$match" != "255.255.255.255" ]]; then
-      emit "ipv4" "$match" "medium"
+      emit "ipv4" "$match" "medium" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_o '\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b')
 fi
@@ -487,7 +620,7 @@ fi
 # Detected FIRST (and excluded below) so it never gets misread as IPv6.
 if [[ $HAS_COLON -eq 1 || "$TEXT" == *-* ]]; then
   while IFS= read -r match; do
-    emit "mac_address" "$match" "medium"
+    emit "mac_address" "$match" "medium" "$match"
   done < <(echo "$TEXT" | pgrep_oi '\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b')
 fi
 
@@ -503,13 +636,13 @@ if [[ $HAS_COLON -eq 1 ]]; then
       continue  # MAC-shaped (6 groups of exactly 2 hex chars) — not IPv6
     fi
     if [[ "$match" == *"::"* ]]; then
-      emit "ipv6" "$match" "medium"
+      emit "ipv6" "$match" "medium" "$match"
       continue
     fi
     colons="${match//[^:]/}"
     groups=$(( ${#colons} + 1 ))
     if [[ $groups -ge 4 && "$match" =~ [a-fA-F] ]]; then
-      emit "ipv6" "$match" "medium"
+      emit "ipv6" "$match" "medium" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_oi '(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:)*::[0-9a-f:]*')
 fi
@@ -520,7 +653,7 @@ fi
 if [[ $HAS_DIGIT -eq 1 ]]; then
   while IFS= read -r match; do
     if base58check_valid "$match"; then
-      emit "bitcoin_address" "$match" "medium"
+      emit "bitcoin_address" "$match" "medium" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_o '\b(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{25,89})\b')
 fi
@@ -531,7 +664,7 @@ fi
 if [[ $HAS_0X -eq 1 ]]; then
   while IFS= read -r match; do
     if eth_valid "$match"; then
-      emit "ethereum_address" "$match" "medium"
+      emit "ethereum_address" "$match" "medium" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_o '\b0x[0-9a-fA-F]{40}\b')
 fi
@@ -544,7 +677,7 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
   while IFS= read -r match; do
     digits="${match//[- ]/}"
     if ssn_valid "$digits"; then
-      emit "us_ssn" "$digits" "high"
+      emit "us_ssn" "$digits" "high" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_o '\b(\d{3})([- ])(\d{2})\2(\d{4})\b')
 fi
@@ -568,10 +701,10 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
     [[ $ssn_kw -eq 0 && $aba_kw -eq 0 ]] && continue
     while IFS= read -r match; do
       if [[ $ssn_kw -eq 1 ]] && ssn_valid "$match"; then
-        emit "us_ssn" "$match" "high"
+        emit "us_ssn" "$match" "high" "$line"
       fi
       if [[ $aba_kw -eq 1 ]] && aba_valid "$match"; then
-        emit "aba_routing" "$match" "high"
+        emit "aba_routing" "$match" "high" "$line"
       fi
     done < <(echo "$line" | pgrep_o '\b[0-9]{9}\b')
   done <<< "$TEXT"
@@ -582,7 +715,7 @@ fi
 # like https://host:443/path@thing no longer matches.
 if [[ $HAS_SCHEME -eq 1 ]]; then
   while IFS= read -r match; do
-    emit "url_credentials" "$match" "high"
+    emit "url_credentials" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o 'https?://[^\s/@:]+:[^\s/@]+@[^\s]+')
 fi
 
@@ -591,7 +724,7 @@ if [[ $HAS_SCHEME -eq 1 ]]; then
   case "$TEXT" in
     *postgres*|*mysql*|*mongodb*|*redis*|*amqp*)
       while IFS= read -r match; do
-        emit "db_url_credentials" "$match" "high"
+        emit "db_url_credentials" "$match" "high" "$match"
       done < <(echo "$TEXT" | pgrep_o '\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s/@:]+:[^\s/@]+@[^\s]+')
       ;;
   esac
@@ -612,21 +745,21 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
     if luhn_valid "$digits" && [[ ${#digits} -ge 13 ]]; then
       continue
     fi
-    emit "phone_number" "$digits" "medium"
+    emit "phone_number" "$digits" "medium" "$match"
   done < <(echo "$TEXT" | pgrep_o '(?<!\d)(?:\+?1[ -]?)?(?:\(?\d{3}\)?[ -]?)?\d{3}[ -]?\d{4}(?!\d)|\+\d{1,3}[ -]?\d{4,14}(?!\d)')
 fi
 
 # ── 14. US Driver's License (multi-state format) ────────────────────
 if [[ $HAS_LICENSE -eq 1 ]]; then
   while IFS= read -r match; do
-    emit "us_drivers_license" "$match" "medium"
+    emit "us_drivers_license" "$match" "medium" "$match"
   done < <(echo "$TEXT" | pgrep_oi "(?:driver'?s?\\s*(?:license|lic|licence)\\s*(?:#|no\\.?|number)?\\s*[:=]?\\s*)[A-Z]?\\d{4,12}")
 fi
 
 # ── 15/16. AWS Access Key + Secret Key ──────────────────────────────
 if [[ $HAS_AWS -eq 1 ]]; then
   while IFS= read -r match; do
-    emit "aws_access_key" "$match" "high"
+    emit "aws_access_key" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b')
 
   # Previously a variable-length lookbehind, which PCRE (and Perl)
@@ -636,7 +769,7 @@ if [[ $HAS_AWS -eq 1 ]]; then
   # bash by taking the last 40 characters of the match.
   while IFS= read -r match; do
     secret="${match: -40}"
-    emit "aws_secret_key" "$secret" "high"
+    emit "aws_secret_key" "$secret" "high" "$match"
   done < <(echo "$TEXT" | pgrep_oi "aws_secret_access_key\\s*[=:]\\s*[\"']?[A-Za-z0-9/+=]{40}")
 fi
 
@@ -644,7 +777,7 @@ fi
 # Format: 1C11-AA1-AA11 (C=letter excl S,L,O,I,B,Z; 1=digit excl 0)
 if [[ $HAS_DIGIT -eq 1 ]]; then
   while IFS= read -r match; do
-    emit "us_mbi" "$match" "medium"
+    emit "us_mbi" "$match" "medium" "$match"
   done < <(echo "$TEXT" | pgrep_o '\b[1-9][AC-HJKMNP-RT-Y][0-9AC-HJKMNP-RT-Y][0-9]-[A-Z]{2}[0-9]-[A-Z]{2}[0-9]{2}\b')
 fi
 
@@ -660,7 +793,7 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
       continue
     fi
     if vin_valid "$match"; then
-      emit "vin" "$match" "high"
+      emit "vin" "$match" "high" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_oi '\b[A-HJ-NPR-Z0-9]{17}\b')
 fi
@@ -668,42 +801,42 @@ fi
 # ── 19. GitHub Personal Access Token ─────────────────────────────────
 if [[ "$TEXT" == *ghp_* || "$TEXT" == *gho_* || "$TEXT" == *ghu_* || "$TEXT" == *ghs_* || "$TEXT" == *ghr_* || "$TEXT" == *github_pat_* ]]; then
   while IFS= read -r match; do
-    emit "github_pat" "$match" "high"
+    emit "github_pat" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\b(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82})\b')
 fi
 
 # ── 20. GitLab Personal Access Token ─────────────────────────────────
 if [[ "$TEXT" == *glpat-* ]]; then
   while IFS= read -r match; do
-    emit "gitlab_pat" "$match" "high"
+    emit "gitlab_pat" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\bglpat-[A-Za-z0-9_-]{20}\b')
 fi
 
 # ── 21. Slack Token ──────────────────────────────────────────────────
 if [[ "$TEXT" == *xox* ]]; then
   while IFS= read -r match; do
-    emit "slack_token" "$match" "high"
+    emit "slack_token" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\bxox[abposr]-[A-Za-z0-9-]{10,}\b')
 fi
 
 # ── 22. Slack Webhook URL ────────────────────────────────────────────
 if [[ "$TEXT" == *hooks.slack.com* ]]; then
   while IFS= read -r match; do
-    emit "slack_webhook" "$match" "high"
+    emit "slack_webhook" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o 'hooks\.slack\.com/services/T[A-Za-z0-9_/]+')
 fi
 
 # ── 23. Stripe API Key ───────────────────────────────────────────────
 if [[ "$TEXT" == *sk_live_* || "$TEXT" == *sk_test_* || "$TEXT" == *rk_live_* || "$TEXT" == *rk_test_* ]]; then
   while IFS= read -r match; do
-    emit "stripe_api_key" "$match" "high"
+    emit "stripe_api_key" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\b[rs]k_(?:live|test)_[A-Za-z0-9]{20,}\b')
 fi
 
 # ── 24. Anthropic API Key ────────────────────────────────────────────
 if [[ "$TEXT" == *sk-ant-* ]]; then
   while IFS= read -r match; do
-    emit "anthropic_api_key" "$match" "high"
+    emit "anthropic_api_key" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\bsk-ant-[A-Za-z0-9_-]{20,}\b')
 fi
 
@@ -712,42 +845,42 @@ fi
 # alongside anthropic_api_key on the same value.
 if [[ "$TEXT" == *sk-* ]]; then
   while IFS= read -r match; do
-    emit "openai_api_key" "$match" "high"
+    emit "openai_api_key" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\bsk-(?!ant-)[A-Za-z0-9_-]{20,}\b')
 fi
 
 # ── 26. Google API Key ───────────────────────────────────────────────
 if [[ "$TEXT" == *AIza* ]]; then
   while IFS= read -r match; do
-    emit "google_api_key" "$match" "high"
+    emit "google_api_key" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\bAIza[0-9A-Za-z_-]{35}\b')
 fi
 
 # ── 27. SendGrid API Key ─────────────────────────────────────────────
 if [[ "$TEXT" == *SG.* ]]; then
   while IFS= read -r match; do
-    emit "sendgrid_api_key" "$match" "high"
+    emit "sendgrid_api_key" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b')
 fi
 
 # ── 28. npm Token ─────────────────────────────────────────────────────
 if [[ "$TEXT" == *npm_* ]]; then
   while IFS= read -r match; do
-    emit "npm_token" "$match" "high"
+    emit "npm_token" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\bnpm_[A-Za-z0-9]{36}\b')
 fi
 
 # ── 29. JWT ──────────────────────────────────────────────────────────
 if [[ "$TEXT" == *eyJ* ]]; then
   while IFS= read -r match; do
-    emit "jwt" "$match" "high"
+    emit "jwt" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b')
 fi
 
 # ── 30. Private Key Block ────────────────────────────────────────────
 if [[ "$TEXT" == *BEGIN* ]]; then
   while IFS= read -r match; do
-    emit "private_key_block" "$match" "high"
+    emit "private_key_block" "$match" "high" "$match"
   done < <(echo "$TEXT" | pgrep_o '-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY( BLOCK)?-----')
 fi
 
@@ -763,7 +896,7 @@ if [[ $HAS_COLON -eq 1 || "$TEXT" == *=* ]]; then
     [[ "$value" =~ ^[a-z]+$ ]] && continue
     ent=$(shannon_entropy "$value")
     if awk -v e="$ent" 'BEGIN{exit !(e>=3.5)}'; then
-      emit "generic_secret" "$value" "medium"
+      emit "generic_secret" "$value" "medium" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_oi '\b(?:api[_-]?key|secret|token|password|passwd|auth)\b\s*[:=]\s*["'"'"']?[A-Za-z0-9+/_=-]{16,64}')
 fi
@@ -776,7 +909,7 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
     *[Nn][Hh][Ss]*)
       while IFS= read -r match; do
         if nhs_valid "$match"; then
-          emit "nhs_number" "${match//[- ]/}" "high"
+          emit "nhs_number" "${match//[- ]/}" "high" "$match"
         fi
       done < <(echo "$TEXT" | pgrep_o '\b\d{3}[ -]?\d{3}[ -]?\d{4}\b')
       ;;
@@ -797,7 +930,7 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
         while IFS= read -r match; do
           digits="${match//[- ]/}"
           if luhn_valid "$digits"; then
-            emit "sin_canadian" "$digits" "high"
+            emit "sin_canadian" "$digits" "high" "$match"
           fi
         done < <(echo "$TEXT" | pgrep_o '\b\d{3}[ -]?\d{3}[ -]?\d{3}\b')
       fi
@@ -811,7 +944,7 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
     *[Nn][Pp][Ii]*)
       while IFS= read -r match; do
         if npi_valid "$match"; then
-          emit "npi_number" "$match" "high"
+          emit "npi_number" "$match" "high" "$match"
         fi
       done < <(echo "$TEXT" | pgrep_o '\b\d{10}\b')
       ;;
@@ -824,7 +957,7 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
     *[Dd][Ee][Aa]*)
       while IFS= read -r match; do
         if dea_valid "$match"; then
-          emit "dea_number" "$match" "high"
+          emit "dea_number" "$match" "high" "$match"
         fi
       done < <(echo "$TEXT" | pgrep_o '\b[A-Za-z]{2}\d{7}\b')
       ;;
@@ -841,9 +974,9 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
   while IFS= read -r match; do
     digits="${match//[- ]/}"
     if [[ $itin_kw -eq 1 ]]; then
-      emit "us_itin" "$digits" "high"
+      emit "us_itin" "$digits" "high" "$match"
     else
-      emit "us_itin" "$digits" "medium"
+      emit "us_itin" "$digits" "medium" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_o '\b9\d{2}[- ]?(?:7\d|8[0-8]|9[0-2]|9[4-9])[- ]?\d{4}\b')
 fi

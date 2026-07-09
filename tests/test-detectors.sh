@@ -121,6 +121,42 @@ assert_no_detect "Excluded: test@" "test@example.com"
 assert_no_detect "Excluded: noreply@" "noreply@example.com"
 
 echo ""
+echo "=== Email Detectors: mailto: prefix (verified MAJOR bug) ==="
+# The email boundary used to be a single (?<![:/@]) lookbehind applied to
+# the whole match start. That blocks the ':' right after "mailto:" from
+# ever being a valid start position, which broke mailto: two ways at
+# once: ZERO detection when the local part has no interior '.' (nothing
+# else in "foo" can start a match), and TRUNCATION when it does (the
+# match starts at the first substring after an interior '.' that both
+# opens a \b boundary and isn't preceded by ':', silently dropping
+# everything before that dot). Fixed via a lookbehind alternation that
+# allows a match to start either right after a literal "mailto:" prefix
+# or wherever the original exclusion applied.
+assert_detects "mailto: local part with NO interior dot (was ZERO detection)" \
+  "mailto:foo@bar-company.com" "email"
+assert_detects "mailto: local part WITH interior dot (was truncated, dropping 'jane.')" \
+  "mailto:jane.smith@doecorp.com" "email"
+assert_detects "Plain email still detected (mailto fix didn't regress this)" \
+  "reach me at jane.doe@acme-corp.com please" "email"
+
+mailto_full_output=$(bash "$DETECTORS" "mailto:jane.smith@doecorp.com" 2>/dev/null || true)
+if echo "$mailto_full_output" | grep -q '"value":"ja'; then
+  PASS=$((PASS + 1))
+  echo "  PASS: mailto: full local part captured (redacted value starts 'ja...', not truncated to 'sm...')"
+else
+  FAIL=$((FAIL + 1))
+  echo "  FAIL: mailto: local part appears truncated (expected redacted value to start with 'ja')"
+  echo "        output: $mailto_full_output"
+fi
+
+# Original intent preserved: the password in a URL's userinfo must still
+# NOT be reported as an "email" (this is what the lookbehind was for in
+# the first place — a mailto: prefix is now special-cased, but a bare
+# ":" before an email-shaped string, as in user:pass@host, still blocks).
+assert_type_absent "URL userinfo password still NOT reported as email" \
+  "https://admin:secret123@db.example.com" "email"
+
+echo ""
 echo "=== SSN Detectors ==="
 # 078-05-1120 / 219099999 are SSA-published example SSNs — now suppressed
 # by the placeholder denylist (bug #12), so the positive cases here use
@@ -275,6 +311,21 @@ if command -v jq >/dev/null 2>&1; then
   fi
 else
   echo "  SKIP: jq not available, skipping JSON-validity check"
+fi
+
+echo ""
+echo "=== Custom Rules Engine (canary/scripts/custom_rules.py --selftest) ==="
+if command -v python3 >/dev/null 2>&1; then
+  if custom_rules_selftest_output=$(python3 "$SCRIPT_DIR/canary/scripts/custom_rules.py" --selftest 2>&1); then
+    PASS=$((PASS + 1))
+    echo "  PASS: custom_rules.py --selftest (all internal assertions passed)"
+  else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: custom_rules.py --selftest reported failures"
+    echo "$custom_rules_selftest_output"
+  fi
+else
+  echo "  SKIP: python3 not available, skipping custom_rules.py --selftest"
 fi
 
 echo ""
