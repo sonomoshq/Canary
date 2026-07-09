@@ -71,8 +71,11 @@ always shown pre-redacted by detectors.sh.
 False-positive suppression:
   - A line containing the literal text "# canary-ignore" is never flagged.
   - In .md files, a fenced ``` code block is treated as a documentation
-    example (and skipped) when the line immediately before the opening
-    fence contains the word "example".
+    example (and skipped) when the nearest preceding NON-BLANK line
+    contains example/sample/e.g./for instance/demo (case-insensitive),
+    or the fence's own opening line (its info-string) does. A blank
+    line between the introducing prose and the fence does not defeat
+    this — only another non-blank, non-qualifying line does.
 EOF
 }
 
@@ -233,26 +236,39 @@ is_canary_extension() {
 
 # compute_example_fences FILE — print the line numbers (1-indexed,
 # inclusive of the fence markers) that fall inside a ``` fenced code block
-# whose immediately preceding non-fence line contains the word "example".
-# This is a deliberately simple heuristic, documented in --help.
+# that is documentation-example context: either the NEAREST PRECEDING
+# NON-BLANK line contains one of example/sample/e.g./for instance/demo
+# (case-insensitive), or the fence's own opening line (its info-string,
+# e.g. "```bash example") does. Blank lines between the introducing prose
+# and the fence (idiomatic Markdown) do NOT clear the example context —
+# only another non-blank, non-qualifying line does. This is a
+# deliberately simple heuristic, documented in --help.
 compute_example_fences() {
   awk '
+    function has_example(s,    t) {
+      t = tolower(s)
+      return (index(t, "example") > 0 || index(t, "sample") > 0 || \
+              index(t, "e.g.") > 0 || index(t, "for instance") > 0 || \
+              index(t, "demo") > 0)
+    }
     /^```/ {
       if (in_fence == 0) {
         in_fence = 1
         fence_start = NR
-        is_example = prev_had_example
+        is_example = (prev_had_example || has_example($0)) ? 1 : 0
       } else {
         in_fence = 0
         if (is_example) { for (i = fence_start; i <= NR; i++) print i }
         is_example = 0
       }
-      prev_had_example = 0
       next
     }
     {
-      if (in_fence == 0) {
-        prev_had_example = (index(tolower($0), "example") > 0) ? 1 : 0
+      # Only a genuinely non-blank line updates the "nearest preceding
+      # non-blank line" state; blank lines are skipped so a blank line
+      # before the fence (the idiomatic case) can never erase it.
+      if (in_fence == 0 && $0 !~ /^[[:space:]]*$/) {
+        prev_had_example = has_example($0) ? 1 : 0
       }
     }
   ' "$1" 2>/dev/null || true
