@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Copyright © 2026 Sonomos, Inc.
+# All rights reserved.
+#
+# canary-token — CLI for Canary Tokens: mint decoy secrets/PII, plant
+# them as conventional-looking files, and check whether one has been
+# leaked to Claude.
+#
+# Usage: canary-token new <aws|card|ssn|env|dburl|freeform> [label]
+#        canary-token plant <aws|card|ssn|env|dburl|freeform> [path] [label]
+#        canary-token list
+#        canary-token trips
+#        canary-token revoke <id>
+#        canary-token ack
+#        canary-token --help
+#
+# Thin dispatcher over canary/scripts/canary-tokens.sh (the library) —
+# every subcommand and all the minting/registry logic lives there so
+# there is exactly one implementation. jq-optional: every command
+# degrades to plain-text parsing without jq (registration only gets
+# marginally more robust JSON escaping when jq is present).
+
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB="$BIN_DIR/../scripts/canary-tokens.sh"
+
+if [[ ! -r "$LIB" ]]; then
+  echo "canary-token: cannot find canary-tokens.sh library (expected at $LIB)" >&2
+  exit 1
+fi
+
+# shellcheck source=../scripts/canary-tokens.sh
+source "$LIB"
+
+canary_tokens_cli "$@"

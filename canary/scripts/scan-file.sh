@@ -6,7 +6,10 @@
 # Reads the hook JSON from stdin, extracts the file path, and runs
 # fast-path detectors (credit cards, SSNs, API keys) on the file content.
 # Content-hash indexed so unchanged files are never rescanned, and hits
-# already recorded for a given file are never re-logged.
+# already recorded for a given file are never re-logged. Also runs
+# Canary Tokens' check_text_for_trips (canary-tokens.sh) over the same
+# file content — a certain, literal-match detector alongside the regex
+# detectors above.
 
 set -euo pipefail
 
@@ -162,5 +165,16 @@ if [[ -n "$HITS" ]]; then
 fi
 
 chmod 600 "$LEAKS_FILE" 2>/dev/null || true
+
+# ── Canary Tokens: certain literal match on the same file content ─────
+# Guarded so a missing/unreadable library or empty canaries.jsonl is a
+# zero-overhead, zero-error no-op — this hook must still exit 0.
+if [[ -r "$SCRIPT_DIR/canary-tokens.sh" ]]; then
+  # shellcheck source=canary-tokens.sh
+  source "$SCRIPT_DIR/canary-tokens.sh" 2>/dev/null || true
+  if declare -f check_text_for_trips >/dev/null 2>&1; then
+    printf '%s' "$FILE_TEXT" | check_text_for_trips - "$SRC_TAG" "$SESSION_ID" "$HOOK_CWD" 2>/dev/null || true
+  fi
+fi
 
 exit 0
