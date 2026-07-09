@@ -516,11 +516,9 @@ HAS_LICENSE=0
 case "$TEXT" in *[Ll][Ii][Cc][Ee][Nn]*) HAS_LICENSE=1 ;; esac
 
 # Cheap superset glob for the negative-context dampening word list (see
-# NEG_CTX_PATTERN / context_window() below). This is deliberately looser
-# than the real \b-bounded regex (e.g. it also matches "resample", which
-# the real check won't) — that's fine, it only gates whether we bother
-# computing a per-hit context window at all. Every string the precise
-# regex can match also matches one of these globs, so this adds no
+# NEG_CTX_PATTERN / context_window() below). It only gates whether we
+# bother computing a per-hit context window at all. Every string the
+# precise regex can match also matches one of these globs, so this adds no
 # false-negative risk, just lets texts with none of these words skip the
 # per-hit work entirely.
 HAS_NEG_CTX=0
@@ -532,20 +530,24 @@ case "$TEXT" in
   *[Cc][Hh][Aa][Nn][Gg][Ee][Mm][Ee]*|*[Tt][Ee][Ss][Tt]-[Oo][Nn][Ll][Yy]*|*[Ff][Aa][Kk][Ee]*)
     HAS_NEG_CTX=1 ;;
 esac
-# Precise, \b-bounded pattern re-checked per-hit (only reached when the
-# cheap glob above already passed). Matched via bash's own [[ =~ ]] (glibc
-# ERE, no subshell/fork) rather than pgrep_oi — this runs once per HIT,
-# not once per invocation, so avoiding a fork here matters. Case-folding
-# is spelled out per-letter with bracket expressions instead of `shopt -s
-# nocasematch`, deliberately: that shopt is global for the rest of the
-# script's process lifetime and several OTHER =~ checks below rely on
-# case-SENSITIVE matching (e.g. generic_secret's `[[ "$value" =~
-# ^[a-z]+$ ]]` — turning on nocasematch would make that match mixed-case
-# secrets too and silently suppress them). "your_"/"my_" and "x{4,}"
-# deliberately have no trailing \b — they're meant to catch prefixes like
-# "your_email_here" and runs like "XXXXXXXX", not just a literal token
-# standing alone.
-NEG_CTX_PATTERN='\b([Ee][Xx][Aa][Mm][Pp][Ll][Ee]|[Ss][Aa][Mm][Pp][Ll][Ee]|[Dd][Uu][Mm][Mm][Yy]|[Pp][Ll][Aa][Cc][Ee][Hh][Oo][Ll][Dd][Ee][Rr]|[Ll][Oo][Rr][Ee][Mm]|[Ii][Pp][Ss][Uu][Mm]|[Rr][Ee][Dd][Aa][Cc][Tt][Ee][Dd]|[Tt][Oo][Dd][Oo]|[Ff][Ii][Xx][Mm][Ee]|[Cc][Hh][Aa][Nn][Gg][Ee][Mm][Ee]|[Ff][Aa][Kk][Ee]|[Tt][Ee][Ss][Tt]-[Oo][Nn][Ll][Yy])\b|[Ee]\.[Gg]\.?|[Xx]{4,}|[Yy][Oo][Uu][Rr]_|[Mm][Yy]_'
+# Pattern re-checked per-hit (only reached when the cheap glob above
+# already passed). Matched via bash's own [[ =~ ]] (no subshell/fork) —
+# this runs once per HIT, not once per invocation, so avoiding a fork
+# here matters. NO \b word boundaries: bash's [[ =~ ]] uses the platform
+# C-library regex, and \b is a glibc extension that BSD/macOS regex does
+# not implement (it silently never matches there, which disabled the
+# whole dampener on macOS — caught by the macOS CI leg). POSIX ERE has no
+# word-boundary token common to both glibc and BSD, so we drop bounding
+# entirely; that's harmless here because the dampener only LOWERS
+# confidence one tier, never drops a hit, so a loose substring match
+# (e.g. "sample" inside "resample") at worst under-weights a real hit
+# slightly. Case-folding is spelled out per-letter with bracket
+# expressions instead of `shopt -s nocasematch`, deliberately: that shopt
+# is global for the rest of the process and several OTHER =~ checks below
+# rely on case-SENSITIVE matching (e.g. generic_secret's `[[ "$value" =~
+# ^[a-z]+$ ]]` — nocasematch would make that match mixed-case secrets too
+# and silently suppress them).
+NEG_CTX_PATTERN='([Ee][Xx][Aa][Mm][Pp][Ll][Ee]|[Ss][Aa][Mm][Pp][Ll][Ee]|[Dd][Uu][Mm][Mm][Yy]|[Pp][Ll][Aa][Cc][Ee][Hh][Oo][Ll][Dd][Ee][Rr]|[Ll][Oo][Rr][Ee][Mm]|[Ii][Pp][Ss][Uu][Mm]|[Rr][Ee][Dd][Aa][Cc][Tt][Ee][Dd]|[Tt][Oo][Dd][Oo]|[Ff][Ii][Xx][Mm][Ee]|[Cc][Hh][Aa][Nn][Gg][Ee][Mm][Ee]|[Ff][Aa][Kk][Ee]|[Tt][Ee][Ss][Tt]-[Oo][Nn][Ll][Yy])|[Ee]\.[Gg]\.?|[Xx]{4,}|[Yy][Oo][Uu][Rr]_|[Mm][Yy]_'
 
 # ══════════════════════════════════════════════════════════════════════
 # DETECTORS
