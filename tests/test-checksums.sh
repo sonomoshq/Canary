@@ -24,6 +24,7 @@ eval "$(sed -n '/^is_repeated_digit()/,/^}/p' "$DETECTORS")"
 eval "$(sed -n '/^nhs_valid()/,/^}/p' "$DETECTORS")"
 eval "$(sed -n '/^npi_valid()/,/^}/p' "$DETECTORS")"
 eval "$(sed -n '/^dea_valid()/,/^}/p' "$DETECTORS")"
+eval "$(sed -n '/^nino_valid()/,/^}/p' "$DETECTORS")"
 
 assert_valid() {
   local label="$1"
@@ -114,6 +115,21 @@ assert_valid "Valid DEA 2" "dea_valid" "FA9876547"
 assert_invalid "Wrong check digit" "dea_valid" "AB1234560"
 assert_invalid "Missing letter prefix" "dea_valid" "121234563"
 assert_invalid "Wrong length" "dea_valid" "AB123456"
+
+echo ""
+echo "=== UK NINO Structural Rules (prefix rules, no check digit) ==="
+# NINOs have no check digit; validation is HMRC's prefix rules + A-D
+# suffix (mirrored from the redacta project). See nino_valid().
+assert_valid "Valid NINO (allowed prefix + A-D suffix)" "nino_valid" "JT602491A"
+assert_valid "Valid NINO with spaces" "nino_valid" "JT 60 24 91 A"
+assert_valid "Valid NINO lowercase (normalized)" "nino_valid" "jt602491a"
+assert_invalid "Invalid first letter (one of D F I Q U V)" "nino_valid" "QT602491A"
+assert_invalid "Invalid second letter (O)" "nino_valid" "AO602491A"
+assert_invalid "Administratively-excluded prefix (BG)" "nino_valid" "BG602491A"
+assert_invalid "Administratively-excluded prefix (GB)" "nino_valid" "GB602491A"
+assert_invalid "Invalid suffix (E, outside A-D)" "nino_valid" "JT602491E"
+assert_invalid "Wrong length (8 chars)" "nino_valid" "JT60249A"
+assert_invalid "GOV.UK placeholder QQ123456C (Q is an invalid first letter)" "nino_valid" "QQ123456C"
 
 echo ""
 echo "=== Canadian SIN (reuses Luhn) ==="

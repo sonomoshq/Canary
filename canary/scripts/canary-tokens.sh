@@ -7,8 +7,8 @@
 #
 # The insight: because Canary MINTS the token, a trip is a CERTAIN
 # literal match (grep -F) against a value nobody else could produce —
-# not a probabilistic shape-detection guess like the 36 regex
-# detectors in detectors.sh. 36 detectors guess. This one knows.
+# not a probabilistic shape-detection guess like the 38 regex
+# detectors in detectors.sh. 38 detectors guess. This one knows.
 #
 # Sourceable library + dispatchable CLI. When sourced (e.g. from
 # scan.sh/scan-file.sh), only function/constant definitions run — the
@@ -57,7 +57,7 @@ DETECTORS_SH="$CT_SCRIPT_DIR/detectors.sh"
 # Reuse detectors.sh's validation/hashing primitives via targeted
 # extraction (the same technique tests/test-redact.sh already uses for
 # `redact`) rather than sourcing the whole file. detectors.sh is
-# script-shaped (TEXT="$1"; runs all 36 detectors immediately; `exit 0`
+# script-shaped (TEXT="$1"; runs all 38 detectors immediately; `exit 0`
 # on empty $1) — `source`ing it directly here would either run every
 # detector against our own CLI argv or `exit` this entire process
 # depending on what $1 happened to be. Pulling just the named function
@@ -782,7 +782,7 @@ Commands:
 
 Canary tokens are fake-but-realistic secrets Canary mints itself, so
 when one shows up in something Claude reads, detection is a CERTAIN
-literal match — not a probabilistic guess. 36 detectors guess. This
+literal match — not a probabilistic guess. 38 detectors guess. This
 one knows.
 EOF
 }

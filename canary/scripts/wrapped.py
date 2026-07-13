@@ -64,7 +64,7 @@ _ACRONYMS = {
     "aws", "ssn", "iban", "jwt", "gcp", "vin", "mrn", "pat", "ip", "id",
     "aba", "ein", "fein", "itin", "dea", "npi", "nhs", "sin", "mbi", "bic",
     "swift", "imei", "udid", "mac", "uuid", "url", "api", "jwk", "otp",
-    "us", "cvv", "npm", "db", "icd10",
+    "us", "cvv", "npm", "db", "icd10", "uk", "nino",
 }
 # Words with a specific mixed-case spelling.
 _SPECIAL_WORDS = {

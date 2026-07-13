@@ -9,13 +9,13 @@ allowed-tools: Bash(bash:*), Bash(canary-token:*), Bash(cat:*), Bash(jq:*)
 
 # Canary Tokens — Active Defense
 
-Every other part of Canary is passive: 36 regex detectors *guess* whether
+Every other part of Canary is passive: 38 regex detectors *guess* whether
 something looks like PII or a secret, from its shape. Canary Tokens flip
 that around. Canary mints a fake-but-realistic secret itself, plants it,
 and remembers the exact value it planted. When that exact value later
 shows up in something Claude reads, it isn't a guess about shape — it's
 a literal string match (`grep -F`) against a value nobody else could have
-produced. **36 detectors guess. This one knows.**
+produced. **38 detectors guess. This one knows.**
 
 A "trip" is recorded at `confidence: certain`, distinct from every other
 entry in the leak log, which is at best `high`/`medium`.

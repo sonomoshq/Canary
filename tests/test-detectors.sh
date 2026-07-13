@@ -286,6 +286,35 @@ assert_confidence "US ITIN WITHOUT keyword is 'medium'" "912-70-1234" "us_itin" 
 assert_confidence "US ITIN WITH keyword is 'high'" "itin 912-70-1234" "us_itin" "high"
 
 echo ""
+echo "=== UK Identifiers (redacta-informed: NINO + postcode) ==="
+# National Insurance number — prefix-rule validated, no check digit.
+# JT602491A: J/T are both allowed prefix letters, JT is not an excluded
+# prefix, and suffix A is within A-D. High with an NI keyword nearby,
+# medium on the validated shape alone (mirrors us_itin).
+assert_detects "UK NINO (spaced, with 'national insurance' keyword)" \
+  "for hmrc my national insurance number is JT 60 24 91 A" "uk_nino"
+assert_confidence "UK NINO WITH keyword is 'high'" \
+  "national insurance number JT602491A" "uk_nino" "high"
+assert_confidence "UK NINO WITHOUT keyword is 'medium'" \
+  "reference JT602491A on file" "uk_nino" "medium"
+assert_no_detect "UK NINO invalid first letter (Q) rejected" "value QT602491A here"
+assert_no_detect "UK NINO administratively-excluded prefix (BG) rejected" "code BG602491A"
+assert_no_detect "UK NINO invalid suffix (E, not A-D) rejected" "ni number JT602491E"
+# UK postcode — format-only (Royal Mail postcodes have no check digit).
+# The spaced canonical form counts on its own; the unspaced form needs an
+# address/postcode keyword so it doesn't collide with ordinary tokens.
+assert_detects "UK postcode (spaced canonical form)" \
+  "the office is at EC1A 1BB near the station" "uk_postcode"
+assert_confidence "UK postcode WITH 'postcode' keyword is 'high'" \
+  "my postcode is SW1A 1AA" "uk_postcode" "high"
+assert_confidence "UK postcode spaced, no keyword, is 'medium'" \
+  "posted this near W1A 1AA yesterday" "uk_postcode" "medium"
+assert_type_absent "UK postcode unspaced without keyword does NOT fire" \
+  "build token EC1A1BB completed" "uk_postcode"
+assert_detects "UK postcode unspaced WITH 'address' keyword fires" \
+  "delivery address EC1A1BB" "uk_postcode"
+
+echo ""
 echo "=== Per-run Dedup (bug #12) ==="
 assert_hit_count "Same email twice in one message -> one hit" \
   "email me at dana.lee@northwind-consulting.com or dana.lee@northwind-consulting.com again" "email" 1

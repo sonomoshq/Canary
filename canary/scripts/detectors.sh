@@ -17,10 +17,11 @@
 # Falls back to Perl when grep -P is unavailable. Bash 3.2 compatible:
 # no associative arrays, no mapfile, no ${var,,}.
 #
-# 36 detectors (was 16): every original detector plus mac_address, a
+# 38 detectors (was 16): every original detector plus mac_address, a
 # vendor-secret pack (GitHub/GitLab/Slack/Stripe/Anthropic/OpenAI/Google/
 # SendGrid/npm/JWT/private keys/DB URLs), an entropy-gated generic_secret,
-# and checksum-validated NHS/SIN/NPI/DEA/ITIN identifiers.
+# checksum-validated NHS/SIN/NPI/DEA/ITIN identifiers, and a UK identity
+# pack (National Insurance number w/ HMRC prefix rules, and postcode).
 
 TEXT="$1"
 
@@ -466,6 +467,29 @@ dea_valid() {
   [[ "$digits" =~ ^[0-9]{7}$ ]] || return 1
   local sum=$(( (${digits:0:1}+${digits:2:1}+${digits:4:1}) + 2*(${digits:1:1}+${digits:3:1}+${digits:5:1}) ))
   [[ $((sum % 10)) -eq ${digits:6:1} ]]
+}
+
+# ── Utility: UK National Insurance Number structural validation ──────
+# A NINO has NO check digit — validation is prefix rules + suffix only.
+# These are HMRC's published constraints (mirrored by the redacta
+# clinical-de-identification project, whose UK detector set this pack
+# extends Canary with):
+#   * 9 chars total: 2 prefix letters, 6 digits, 1 suffix letter A–D
+#   * first prefix letter is not one of D F I Q U V
+#   * second prefix letter is not one of D F I O Q U V
+#   * the 2-letter prefix is not one of BG GB NK KN TN NT ZZ
+#     (administrative / never allocated)
+# The GOV.UK example "QQ123456C" fails this for free (Q is an invalid
+# first letter), so it never needs a placeholder-denylist entry.
+nino_valid() {
+  local n
+  n=$(printf '%s' "$1" | tr -d ' -' | tr '[:lower:]' '[:upper:]')
+  [[ ${#n} -ne 9 ]] && return 1
+  [[ "$n" =~ ^[A-Z]{2}[0-9]{6}[A-D]$ ]] || return 1
+  case "${n:0:1}" in D|F|I|Q|U|V) return 1 ;; esac
+  case "${n:1:1}" in D|F|I|O|Q|U|V) return 1 ;; esac
+  case "${n:0:2}" in BG|GB|NK|KN|TN|NT|ZZ) return 1 ;; esac
+  return 0
 }
 
 # ── Utility: Shannon entropy (bits/char), used by generic_secret ────
@@ -981,6 +1005,60 @@ if [[ $HAS_DIGIT -eq 1 ]]; then
       emit "us_itin" "$digits" "medium" "$match"
     fi
   done < <(echo "$TEXT" | pgrep_o '\b9\d{2}[- ]?(?:7\d|8[0-8]|9[0-2]|9[4-9])[- ]?\d{4}\b')
+fi
+
+# ── 37. UK National Insurance Number (NINO) ──────────────────────────
+# The UK's tax/identity number — the closest analogue to a US SSN, and a
+# gap in Canary's UK coverage next to the NHS number it already catches.
+# nino_valid() enforces HMRC's prefix rules + A–D suffix; there is no
+# check digit (see that function). Like us_itin, this fires "high" when a
+# national-insurance keyword is nearby and "medium" on the validated
+# shape alone — the prefix rules make the shape distinctive enough to
+# count without a keyword, but not to claim the higher tier.
+if [[ $HAS_DIGIT -eq 1 ]]; then
+  nino_kw=0
+  case "$TEXT" in
+    *[Nn][Ii][Nn][Oo]*|*[Nn]ational[[:space:]][Ii]nsurance*|*[Nn][Ii][[:space:]][Nn]umber*) nino_kw=1 ;;
+  esac
+  while IFS= read -r match; do
+    norm=$(printf '%s' "$match" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
+    if nino_valid "$norm"; then
+      if [[ $nino_kw -eq 1 ]]; then
+        emit "uk_nino" "$norm" "high" "$match"
+      else
+        emit "uk_nino" "$norm" "medium" "$match"
+      fi
+    fi
+  done < <(echo "$TEXT" | pgrep_oi '\b[A-Z]{2} ?[0-9]{2} ?[0-9]{2} ?[0-9]{2} ?[A-D]\b')
+fi
+
+# ── 38. UK Postcode ──────────────────────────────────────────────────
+# A full UK postcode narrows to roughly 15 households, so it is PII under
+# UK-GDPR (and one of the identifiers the redacta research redacts).
+# Royal Mail postcodes have no check digit, so this is format-only.
+# Precision guard: the canonical *spaced* form ("SW1A 1AA") is
+# distinctive enough to count on its own (medium), but the *unspaced*
+# form ("SW1A1AA") collides with ordinary alphanumeric tokens (hex
+# fragments, product codes), so it only counts when an address/postcode
+# keyword is present. A keyword lifts either form to "high".
+if [[ $HAS_DIGIT -eq 1 ]]; then
+  pc_kw=0
+  case "$TEXT" in
+    *[Pp][Oo][Ss][Tt]*[Cc][Oo][Dd][Ee]*|*[Aa][Dd][Dd][Rr][Ee][Ss][Ss]*) pc_kw=1 ;;
+  esac
+  while IFS= read -r match; do
+    case "$match" in
+      *" "*) spaced=1 ;;
+      *) spaced=0 ;;
+    esac
+    [[ $spaced -eq 0 && $pc_kw -eq 0 ]] && continue
+    norm=$(printf '%s' "$match" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
+    if [[ $pc_kw -eq 1 ]]; then
+      emit "uk_postcode" "$norm" "high" "$match"
+    else
+      emit "uk_postcode" "$norm" "medium" "$match"
+    fi
+  done < <(echo "$TEXT" | pgrep_oi '\b(?:GIR ?0AA|[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2})\b')
 fi
 
 exit 0

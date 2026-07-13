@@ -45,6 +45,8 @@
     "us_itin":            { "family": "Identity",  "sensitivity_class": "pii",    "regulatory_tags": ["IRS"],            "risk_weight": 8 },
     "sin_canadian":       { "family": "Identity",  "sensitivity_class": "pii",    "regulatory_tags": ["PIPEDA"],         "risk_weight": 8 },
     "nhs_number":         { "family": "Medical",   "sensitivity_class": "phi",    "regulatory_tags": ["UK-GDPR"],        "risk_weight": 8 },
+    "uk_nino":            { "family": "Identity",  "sensitivity_class": "pii",    "regulatory_tags": ["UK-GDPR"],        "risk_weight": 8 },
+    "uk_postcode":        { "family": "Network",   "sensitivity_class": "pii",    "regulatory_tags": ["UK-GDPR"],        "risk_weight": 3 },
     "us_mbi":             { "family": "Medical",   "sensitivity_class": "phi",    "regulatory_tags": ["HIPAA"],          "risk_weight": 8 },
     "iban":               { "family": "Financial", "sensitivity_class": "financial","regulatory_tags": ["GDPR*"],        "risk_weight": 7 },
     "us_drivers_license": { "family": "Identity",  "sensitivity_class": "pii",    "regulatory_tags": ["HIPAA"],          "risk_weight": 6 },

@@ -7,7 +7,7 @@
 # runs regex detectors, and appends hits to $SONOMOS_DIR/leaks.jsonl.
 # Also runs Canary Tokens' check_text_for_trips (canary-tokens.sh) over
 # the same extracted text — a certain, literal-match detector alongside
-# the 36 probabilistic regex detectors.
+# the 38 probabilistic regex detectors.
 # LLM scanning runs automatically via the Stop prompt hook (record-llm-hit.sh).
 # The /canary:scan skill provides deeper manual scanning of the full conversation.
 

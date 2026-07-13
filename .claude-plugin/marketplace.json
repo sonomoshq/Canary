@@ -12,7 +12,7 @@
     {
       "name": "canary",
       "source": "./canary",
-      "description": "Sonomos Canary — persistent PII leak counter. 36 checksum-validated regex detectors (plus your own custom rules) and Claude self-scan track sensitive data you expose to Claude, Canary Tokens give a CERTAIN alarm the instant a planted decoy secret leaks, and Canary Wrapped turns your history into a shareable recap — with a weighted risk score, an interactive dashboard, a persistent HUD, and a plugin-security audit for your installed extensions.",
+      "description": "Sonomos Canary — persistent PII leak counter. 38 checksum-validated regex detectors (plus your own custom rules) and Claude self-scan track sensitive data you expose to Claude, Canary Tokens give a CERTAIN alarm the instant a planted decoy secret leaks, and Canary Wrapped turns your history into a shareable recap — with a weighted risk score, an interactive dashboard, a persistent HUD, and a plugin-security audit for your installed extensions.",
       "author": {
         "name": "Sonomos, Inc."
       },
