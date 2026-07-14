@@ -180,6 +180,20 @@ assert_no_detect "Exact-literal placeholder PAN is still fully dropped, not just
   "example card: 4111111111111111"
 
 echo ""
+echo "=== UK Identifiers: precision guards (redacta-informed) ==="
+# A NINO-shaped value whose prefix breaks HMRC's rules must not count —
+# nino_valid() rejects it, so the detector stays silent entirely.
+assert_no_detect "NINO-shaped value with excluded prefix (GB) is not flagged" "batch GB602491A ready"
+assert_no_detect "NINO-shaped value with invalid first letter (Q) is not flagged" "ref QT602491A logged"
+# The unspaced postcode form collides with ordinary alphanumeric tokens
+# (build artifacts, product codes, hex fragments), so it must stay silent
+# unless an address/postcode keyword is present.
+assert_type_absent "Unspaced postcode-shaped build token is not a postcode" \
+  "artifact EC1A1BB uploaded to the registry" "uk_postcode"
+assert_type_absent "Unspaced postcode-shaped token on a commit line is not a postcode" \
+  "commit EC1A1BB landed on main" "uk_postcode"
+
+echo ""
 echo "==============================="
 echo "Results: $PASS passed, $FAIL failed"
 echo "==============================="

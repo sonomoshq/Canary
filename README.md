@@ -38,11 +38,11 @@ No API keys. No external services. No config. Two commands and you're running.
 
 ## Plant a Tripwire
 
-Every detector below — all 36 of them, plus any custom rule you add — is a *guess*. It looks at the shape of a value and infers it's probably a secret. That's genuinely useful, but it's still an inference: a coincidentally similar string can fool it, and it can never prove a match is the real thing.
+Every detector below — all 38 of them, plus any custom rule you add — is a *guess*. It looks at the shape of a value and infers it's probably a secret. That's genuinely useful, but it's still an inference: a coincidentally similar string can fool it, and it can never prove a match is the real thing.
 
 **Canary Tokens flip that around.** Canary mints a fake-but-realistic secret itself — an AWS key, a credit card number, an SSN, a database URL, a codename, whatever — and remembers the *exact* value it minted. When that exact value later shows up in something Claude reads, it isn't a guess about shape. It's a literal string match against a value nobody else could have produced.
 
-**36 detectors guess. This one knows.** This is the one place Canary says "proven, not probabilistic" — and means it.
+**38 detectors guess. This one knows.** This is the one place Canary says "proven, not probabilistic" — and means it.
 
 ```bash
 /canary:token plant env
@@ -112,15 +112,15 @@ Same shared scoring model as the dashboard ([below](#score--privacy-report)), so
 <tr>
 <td width="50%">
 
-**36 Regex Detectors** (every message + every file write; a few ms typical, tens of ms on PII-dense text)
+**38 Regex Detectors** (every message + every file write; a few ms typical, tens of ms on PII-dense text)
 
 Real checksum validation where the format actually has one — not just pattern matching:
 
 - **Checksummed:** credit cards (Luhn), IBANs (MOD-97), ABA routing numbers, VINs (MOD-11), NHS numbers (MOD-11), Canadian SINs (Luhn), NPIs (Luhn), DEA numbers
-- **Rule-validated (no true checksum exists):** SSNs (SSA exclusion ranges), ITINs (IRS prefix/range)
+- **Rule-validated (no true checksum exists):** SSNs (SSA exclusion ranges), ITINs (IRS prefix/range), UK National Insurance numbers (HMRC prefix rules)
 - **11 vendor secret keys:** GitHub, GitLab, Slack (token + webhook), Stripe, Anthropic, OpenAI, Google, SendGrid, npm, JWTs, private-key blocks
 - **Network/contact:** emails (including `mailto:` links), phone numbers, IPv4/IPv6, MAC addresses
-- **Other:** DB connection strings, URL-embedded credentials, entropy-gated generic secrets, driver's licenses, Medicare MBIs
+- **Other:** DB connection strings, URL-embedded credentials, entropy-gated generic secrets, driver's licenses, Medicare MBIs, UK postcodes (format-only, so *medium* confidence unless address context lifts it)
 - Bitcoin & Ethereum addresses — format-checked only, so these are flagged at *medium* confidence, not high (see [THREAT_MODEL.md](THREAT_MODEL.md))
 - **Plus your own** — drop a rule under `rules.d/` and Canary runs it too (see [Custom Detectors](#custom-detectors-rulesd) below)
 
@@ -175,7 +175,7 @@ Claude processes it ──> Stop hook fires (async, invisible)
                               |
               ┌───────────────┼───────────────┐
          Regex + Rules   Claude Self-Scan   Canary Token Check
-        (36 types + your  (~33 categories,   (certain grep -F
+        (38 types + your  (~33 categories,   (certain grep -F
          rules.d/ rules)  regex overlap       match, not a guess)
                           excluded)
               └───────────────┼───────────────┘
@@ -279,7 +279,7 @@ Want the HUD as a static image instead of a live statusline? `canary-card` rende
 
 ## Custom Detectors (`rules.d`)
 
-Drop a JSON file at `${CLAUDE_PLUGIN_DATA:-~/.sonomos}/rules.d/your-rule.json` and Canary runs it as an extra detection stage, right after the 36 built-ins, with zero code changes:
+Drop a JSON file at `${CLAUDE_PLUGIN_DATA:-~/.sonomos}/rules.d/your-rule.json` and Canary runs it as an extra detection stage, right after the 38 built-ins, with zero code changes:
 
 ```json
 {
@@ -299,7 +299,7 @@ Safe by construction: patterns are only ever `re.compile`'d — never `eval`'d o
 
 Your conversation isn't the only thing that can leak. Installed skills, agents, and MCP servers run with real permissions — filesystem access, environment variables, sometimes network egress — and a careless or malicious one is a bigger risk than anything you type. `/canary:audit` turns Canary's detection engine on your **installed extensions** instead of your chat:
 
-- **Leaked secrets** — the same 36-detector engine, checking for API keys, tokens, and private keys accidentally committed into a skill or agent file
+- **Leaked secrets** — the same 38-detector engine, checking for API keys, tokens, and private keys accidentally committed into a skill or agent file
 - **Exfiltration patterns** — curl-pipe-shell, base64-decode-and-exec, known collector domains (webhook.site, ngrok, Discord/Telegram bot APIs, ...), reads of `~/.ssh`, `~/.aws/credentials`, or `~/.netrc`, environment-harvesting pipes, hidden zero-width/RTL-override Unicode, wildcard tool permissions
 
 ```bash

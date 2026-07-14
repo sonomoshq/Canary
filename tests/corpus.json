@@ -222,6 +222,30 @@
       ],
       "preserve": [],
       "expected_miss": false
+    },
+    {
+      "id": "prose-uk-nino",
+      "surface": "prose",
+      "text": "For the tax form, my national insurance number is JT 60 24 91 A.",
+      "gold": [ { "value": "JT 60 24 91 A", "type": "uk_nino" } ],
+      "preserve": [],
+      "expected_miss": false
+    },
+    {
+      "id": "leakage-uk-postcode",
+      "surface": "leakage",
+      "text": "shipping export still lists the customer address: 42 Willow Lane, London EC1A 1BB",
+      "gold": [ { "value": "EC1A 1BB", "type": "uk_postcode" } ],
+      "preserve": [],
+      "expected_miss": false
+    },
+    {
+      "id": "nearmiss-unspaced-postcode-token",
+      "surface": "near-miss",
+      "text": "the CI build artifact EC1A1BB was uploaded to the registry",
+      "gold": [],
+      "preserve": [ { "value": "EC1A1BB", "type": "uk_postcode", "reason": "unspaced postcode-shaped token with no address/postcode keyword nearby — the precision guard must keep it silent" } ],
+      "expected_miss": false
     }
   ]
 }

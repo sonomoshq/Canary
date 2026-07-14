@@ -37,7 +37,7 @@ canary-badge                # offline SVG badge for your repo README
 
 ## Detection, in brief
 
-- **Regex (automatic, every Stop + every file write/edit):** 36 detector types, checksum-validated where the format supports it — plus your own via `rules.d/*.json` (see `canary/scripts/rules.d.README.md`), no code changes required.
+- **Regex (automatic, every Stop + every file write/edit):** 38 detector types, checksum-validated where the format supports it — plus your own via `rules.d/*.json` (see `canary/scripts/rules.d.README.md`), no code changes required.
 - **Claude self-scan (automatic, zero cost):** semantic categories regex can't catch — names, addresses, legal IDs, medical records, trade secrets — on every Stop hook. Categories the regex layer already owns are excluded here to avoid double-counting.
 - **Canary Tokens (active defense, on demand to plant, automatic to detect):** decoy secrets Canary mints itself. A trip is a literal, certain match — not a shape-based guess like every detector above.
 - **`/canary:audit` (on demand):** turns the same detector library on your *installed extensions* instead of your conversation.
@@ -53,7 +53,7 @@ canary/
 ├── .claude-plugin/plugin.json       # Plugin manifest
 ├── hooks/hooks.json                 # Stop, PostToolUse, SessionStart hooks
 ├── scripts/
-│   ├── detectors.sh                 # 36 regex detectors with checksum validation
+│   ├── detectors.sh                 # 38 regex detectors with checksum validation
 │   ├── custom_rules.py              # User-defined detector rules (rules.d/*.json)
 │   ├── rules.d.README.md            # Custom rule schema + worked examples
 │   ├── canary-tokens.sh             # Canary Tokens library: mint/plant/trip-detect

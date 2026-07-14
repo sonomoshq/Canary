@@ -114,6 +114,7 @@ CATEGORY_MAP = {
         "name", "entity_name", "email", "us_ssn", "us_passport", "date_of_birth",
         "us_drivers_license", "national_id", "tin_non_us",
         "sin_canadian", "us_itin", "passport_non_us", "license_plate", "us_mbi",
+        "uk_nino",
     ],
     "Financial": [
         "credit_card", "iban", "aba_routing", "us_bank_account", "swift_bic",
@@ -147,6 +148,7 @@ CATEGORY_MAP = {
     ],
     "Network": [
         "ipv4", "ipv6", "geolocation", "street_address", "zip_code", "phone_number",
+        "uk_postcode",
     ],
     "Organizational": [
         "customer_data", "employee_data", "third_party_data",
@@ -160,7 +162,7 @@ _ACRONYMS = {
     "aws", "ssn", "iban", "jwt", "gcp", "vin", "mrn", "pat", "ip", "id",
     "aba", "ein", "fein", "itin", "dea", "npi", "nhs", "sin", "mbi", "bic",
     "swift", "imei", "udid", "mac", "uuid", "url", "api", "jwk", "otp",
-    "us", "cvv", "npm", "db",
+    "us", "cvv", "npm", "db", "uk", "nino",
 }
 # Words with a specific mixed-case spelling.
 _SPECIAL_WORDS = {

@@ -22,7 +22,7 @@ The one deliberate exception is `canary-badge`: its SVG output is `chmod 0644` o
 
 ## What Regex Can't Catch
 
-The regex layer (`detectors.sh`, 36 types) only fires on text with a structured, matchable *shape*: a Luhn-valid digit run, an `sk-ant-` prefix, a MOD-97-valid IBAN. It has no notion of meaning. It cannot catch:
+The regex layer (`detectors.sh`, 38 types) only fires on text with a structured, matchable *shape*: a Luhn-valid digit run, an `sk-ant-` prefix, a MOD-97-valid IBAN. It has no notion of meaning. It cannot catch:
 
 - **Names** — "call Jordan Ellis Whitfield back" has no shape to match on.
 - **Prose PII** — a phone number spelled out in words, an address split across two sentences, a salary mentioned in passing ("she makes about 140k").
@@ -56,13 +56,13 @@ Canary Tokens (`/canary:token`, `canary-tokens.sh`) invert the trust model the r
 
 ## Honest Validation Limits
 
-"36 checksum-validated detectors" is marketing shorthand for a spread of actual rigor. Being specific about where on that spread each type falls:
+"38 checksum-validated detectors" is marketing shorthand for a spread of actual rigor. Being specific about where on that spread each type falls:
 
 **Real, verifiable checksums** (8 types) — a forged value has to satisfy actual arithmetic, not just look plausible: `credit_card` (Luhn), `iban` (MOD-97), `aba_routing` (weighted check-digit formula), `vin` (MOD-11), `nhs_number` (MOD-11), `sin_canadian` (Luhn), `npi_number` (Luhn against the fixed `80840` prefix), `dea_number` (check-digit formula).
 
-**Range/exclusion rules, not checksums** — `us_ssn` validates against SSA-published exclusion rules (area `000`/`666`, area `900`-`999`, group `00`, serial `0000` are all rejected) but the SSA has never published a true check digit; most of the ~9-digit space that isn't excluded will pass. `us_itin` similarly checks only the `9xx` prefix and a valid group-number range — no ITIN check digit exists to validate against. Both are still labeled `"high"` confidence in the code (the punctuated/keyword-gated shape is distinctive in practice), but that's a weaker guarantee than the 8 types above.
+**Range/exclusion rules, not checksums** — `us_ssn` validates against SSA-published exclusion rules (area `000`/`666`, area `900`-`999`, group `00`, serial `0000` are all rejected) but the SSA has never published a true check digit; most of the ~9-digit space that isn't excluded will pass. `us_itin` similarly checks only the `9xx` prefix and a valid group-number range — no ITIN check digit exists to validate against. `uk_nino` (UK National Insurance number) is the same shape of guarantee: it enforces HMRC's prefix rules — disallowed first/second letters, and the never-allocated `BG`/`GB`/`NK`/`KN`/`TN`/`NT`/`ZZ` prefixes — plus an `A`–`D` suffix, but a NINO carries no check digit either, so those rules reject structurally-impossible values rather than proving a well-formed one is genuine. It fires `"high"` only with a national-insurance keyword nearby and `"medium"` on the validated shape alone, mirroring `us_itin`. All are labeled more confidently than a bare pattern match because the shape is distinctive in practice, but that's a weaker guarantee than the 8 checksummed types above.
 
-**Format-only, deliberately downgraded** — `bitcoin_address` and `ethereum_address` match the correct shape (Base58/Bech32 length and alphabet; `0x` + 40 hex chars) but do **not** perform the real Base58Check (SHA256d) or EIP-55 (Keccak-256) checksum, which would require crypto dependencies this project deliberately doesn't ship. `detectors.sh` reflects this honestly: both are emitted at `"medium"` confidence, not `"high"`, specifically so they don't read as more validated than they are.
+**Format-only, deliberately downgraded** — `bitcoin_address` and `ethereum_address` match the correct shape (Base58/Bech32 length and alphabet; `0x` + 40 hex chars) but do **not** perform the real Base58Check (SHA256d) or EIP-55 (Keccak-256) checksum, which would require crypto dependencies this project deliberately doesn't ship. `detectors.sh` reflects this honestly: both are emitted at `"medium"` confidence, not `"high"`, specifically so they don't read as more validated than they are. `uk_postcode` is the same story for a different reason: Royal Mail postcodes have no check digit at all, so it is format-only by nature — emitted at `"medium"` for the distinctive spaced form, reaching `"high"` only when an address/postcode keyword confirms the context, and with the ambiguous *unspaced* form suppressed entirely without that keyword so it can't collide with ordinary alphanumeric tokens.
 
 **Heuristic, not deterministic** — `generic_secret` fires on Shannon entropy ≥ 3.5 bits/char plus a keyword-adjacent assignment (`api_key =`, `token:`, ...). This is a real signal, but it's probabilistic: a short, memorable-but-real secret can score below the threshold, and enough random-looking text can score above it.
 

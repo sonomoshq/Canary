@@ -66,7 +66,7 @@ Follow one of these two patterns for any new fixture that resembles a credential
 5. Set `confidence` to `"high"` only when checksum-validated or otherwise unambiguous; `"medium"` for format-only matches.
 6. Add positive and negative tests to `tests/test-detectors.sh` (using the defang convention above for anything secret-shaped) and false-positive cases to `tests/test-no-false-positives.sh`.
 7. Add at least one case to `tests/corpus.json` — a `gold` entry under the most relevant `surface`, plus a `preserve` entry if the new detector could plausibly collide with an existing one. Run `bash tests/test-corpus.sh` and update `tests/baseline.json` if recall improved (see above).
-8. Update the detector count (currently 36) in `README.md` if you're adding or removing a type — and in `canary/hooks/hooks.json`'s Stop prompt "skip" list, so the LLM layer doesn't try to double-count a category the regex layer now owns.
+8. Update the detector count (currently 38) in `README.md` if you're adding or removing a type — and in `canary/hooks/hooks.json`'s Stop prompt "skip" list, so the LLM layer doesn't try to double-count a category the regex layer now owns.
 
 ## Code Style
 
@@ -78,7 +78,7 @@ Follow one of these two patterns for any new fixture that resembles a credential
 
 ## What We're Looking For
 
-- New detectors for region-specific PII (UK NI, EU VAT, etc.)
+- New detectors for region-specific PII (EU VAT, India Aadhaar, Australian TFN, etc. — UK National Insurance numbers and postcodes already shipped)
 - Performance improvements (especially for large `leaks.jsonl` files)
 - Dashboard enhancements
 - Better false positive prevention
